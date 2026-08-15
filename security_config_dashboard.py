@@ -1,29 +1,17 @@
-"""
-Security Configuration & CIS Benchmark Compliance Tool
---------------------------------------------------------
-A Streamlit app that lets a consultant/auditor walk a client through a
-hardening checklist for a chosen technology (based on CIS Benchmark
-categories and general security best practice where a formal CIS
-benchmark doesn't apply), record compliance status + evidence/notes per
-item, and view a live compliance dashboard.
-
-Run with:
-    pip install streamlit pandas plotly gspread google-auth
-    streamlit run security_config_dashboard.py
-
-Cloud persistence (optional):
-    Set up a Google Sheet + service account and add its credentials to
-    Streamlit secrets (see README.md -> "Cloud persistence setup") to get
-    automatic save/load per client that survives app restarts on Streamlit
-    Community Cloud. Without secrets configured, the app still works fully
-    using the CSV export/import already built in.
-"""
-
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import datetime
 import io
+import json
+
+try:
+    from docx import Document
+    from docx.shared import Pt, Inches, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
 
 try:
     import gspread
@@ -119,7 +107,205 @@ def load_from_cloud(client_name: str, technology: str) -> dict:
         }
     return loaded
 
+
+# ---------------------------------------------------------------------------
+# HUGGING FACE - AI-assisted features
+# Uses huggingface_hub.InferenceClient against a chat-capable instruct model.
+# Configure via Streamlit secrets:
+#   [huggingface]
+#   api_key = "hf_xxx"
+#   model = "meta-llama/Llama-3.1-8B-Instruct"   # optional, has a default
+# ---------------------------------------------------------------------------
+
+try:
+    from huggingface_hub import InferenceClient
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+
+DEFAULT_HF_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+
+
+@st.cache_resource(show_spinner=False)
+def get_hf_client():
+    if not HF_AVAILABLE:
+        return None
+    if "huggingface" not in st.secrets or "api_key" not in st.secrets.get("huggingface", {}):
+        return None
+    model = st.secrets["huggingface"].get("model", DEFAULT_HF_MODEL)
+    try:
+        return InferenceClient(model=model, token=st.secrets["huggingface"]["api_key"])
+    except Exception:
+        return None
+
+
+def ai_enabled() -> bool:
+    return get_hf_client() is not None
+
+
+def ask_ai(prompt: str, system: str = "", max_tokens: int = 900) -> str:
+    """Send a chat completion request to the configured HF model. Returns the
+    text response, or an error string prefixed with '⚠️' on failure — callers
+    should check for that prefix before treating the result as trustworthy."""
+    client = get_hf_client()
+    if client is None:
+        return "⚠️ AI features are not configured. Add a Hugging Face token under [huggingface] in Streamlit secrets."
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    try:
+        resp = client.chat_completion(messages=messages, max_tokens=max_tokens, temperature=0.3)
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"⚠️ AI request failed: {e}"
+
+
 st.set_page_config(page_title="Security Config & CIS Compliance Tool", layout="wide")
+
+# ---------------------------------------------------------------------------
+# CONTROL CLASSIFICATION - severity + compliance-framework cross-mapping
+# Rule-based on category/control keywords rather than hand-tagged per item.
+# This is a starting point a reviewer should confirm before client delivery,
+# same as the CIS section references elsewhere in this tool - keyword rules
+# can misclassify an unusual control, so treat this as triage, not a final
+# audit opinion.
+# ---------------------------------------------------------------------------
+
+SEVERITY_WEIGHTS = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
+
+_SEVERITY_RULES = [
+    (4, ["root login", "default password", "empty password", "anonymous", "sa account",
+         "enable secret", "encryption key", "unencrypted", "public", "0.0.0.0/0",
+         "xp_cmdshell", "anonymous auth", "trust-all", "hardcoded"]),
+    (3, ["authentication", "password", "mfa", "multi-factor", "privilege", "admin",
+         "encrypt", "tls", "ssl", "firewall", "acl", "access control", "rbac",
+         "vault", "secrets", "delegation", "superuser", "sa ", "audit trail"]),
+    (2, ["logging", "audit", "monitoring", "patch", "update", "backup", "session",
+         "timeout", "ntp", "dns", "certificate", "header"]),
+]
+
+
+def classify_control(category: str, control: str) -> dict:
+    text = f"{category} {control}".lower()
+    severity = "Low"
+    for weight, keywords in _SEVERITY_RULES:
+        if any(k in text for k in keywords):
+            severity = {4: "Critical", 3: "High", 2: "Medium"}[weight]
+            break
+
+    frameworks = {}
+    if any(k in text for k in ["auth", "password", "mfa", "admin", "privilege", "access control", "acl", "rbac"]):
+        frameworks = {"ISO 27001": "A.9 Access Control", "NIST CSF": "PR.AC", "PCI DSS": "Req 7-8", "SOC 2": "CC6.1"}
+    elif any(k in text for k in ["log", "audit", "monitor"]):
+        frameworks = {"ISO 27001": "A.12.4 Logging & Monitoring", "NIST CSF": "DE.AE / DE.CM", "PCI DSS": "Req 10", "SOC 2": "CC7.2"}
+    elif any(k in text for k in ["encrypt", "tls", "ssl", "certificate"]):
+        frameworks = {"ISO 27001": "A.10 Cryptography", "NIST CSF": "PR.DS", "PCI DSS": "Req 3-4", "SOC 2": "CC6.7"}
+    elif any(k in text for k in ["firewall", "network", "vpn", "interface", "acl", "flow log"]):
+        frameworks = {"ISO 27001": "A.13 Network Security", "NIST CSF": "PR.AC / PR.PT", "PCI DSS": "Req 1", "SOC 2": "CC6.6"}
+    elif any(k in text for k in ["patch", "version", "update", "cpu", "installation"]):
+        frameworks = {"ISO 27001": "A.12.6 Vulnerability Management", "NIST CSF": "ID.RA / PR.MA", "PCI DSS": "Req 6", "SOC 2": "CC7.1"}
+    elif any(k in text for k in ["backup", "recovery", "ha ", "high availability", "replication"]):
+        frameworks = {"ISO 27001": "A.17 Business Continuity", "NIST CSF": "PR.IP / RC.RP", "PCI DSS": "Req 12", "SOC 2": "A1.2"}
+    else:
+        frameworks = {"ISO 27001": "A.12 Operations Security", "NIST CSF": "PR.IP", "PCI DSS": "Req 2", "SOC 2": "CC6.8"}
+
+    return {"severity": severity, "frameworks": frameworks}
+
+
+def build_docx_report(client_name, technology, reviewer_name, weighted_pct, raw_pct,
+                       totals, open_items, exec_summary, all_responses) -> bytes:
+    """Build a client-facing DOCX report. Returns raw bytes for st.download_button."""
+    if not DOCX_AVAILABLE:
+        return b""
+
+    doc = Document()
+
+    title = doc.add_heading("Security Configuration Assessment Report", level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    meta = doc.add_paragraph()
+    meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    meta.add_run(f"Client: {client_name}\n").bold = True
+    meta.add_run(f"Technology Assessed: {technology}\n")
+    meta.add_run(f"Reviewer: {reviewer_name or '—'}\n")
+    meta.add_run(f"Report Date: {datetime.now().strftime('%Y-%m-%d')}")
+
+    doc.add_page_break()
+
+    doc.add_heading("Executive Summary", level=1)
+    if exec_summary:
+        doc.add_paragraph(exec_summary)
+    else:
+        doc.add_paragraph(
+            "Executive summary not generated for this report. Use the "
+            "'Generate Executive Summary' AI feature on the Compliance "
+            "Dashboard tab before exporting to include one here."
+        )
+
+    doc.add_heading("Compliance Overview", level=1)
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Light Grid Accent 1"
+    hdr = table.rows[0].cells
+    hdr[0].text, hdr[1].text = "Metric", "Value"
+    metrics = [
+        ("Risk-Weighted Compliance", f"{weighted_pct}%"),
+        ("Raw Compliance", f"{raw_pct}%"),
+        ("Total Controls Assessed", str(totals["total"])),
+        ("Compliant", str(totals["compliant"])),
+        ("Non-Compliant", str(totals["noncompliant"])),
+        ("Compensating Control", str(totals["compensating"])),
+        ("Not Reviewed", str(totals["not_reviewed"])),
+    ]
+    for label, value in metrics:
+        row = table.add_row().cells
+        row[0].text, row[1].text = label, value
+
+    doc.add_heading("Open Findings (Remediation Tracker)", level=1)
+    if open_items:
+        sev_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+        sorted_items = sorted(open_items, key=lambda x: sev_order.get(x.get("Severity"), 4))
+        ftable = doc.add_table(rows=1, cols=5)
+        ftable.style = "Light Grid Accent 1"
+        fhdr = ftable.rows[0].cells
+        for idx, label in enumerate(["Item", "Severity", "Control", "Audit Step", "Notes"]):
+            fhdr[idx].text = label
+        for it in sorted_items:
+            row = ftable.add_row().cells
+            row[0].text = str(it.get("Item", ""))
+            row[1].text = str(it.get("Severity", ""))
+            row[2].text = str(it.get("Control", ""))
+            row[3].text = str(it.get("Audit Step", ""))
+            row[4].text = str(it.get("Notes", "") or "")
+    else:
+        doc.add_paragraph("No open Non-Compliant findings at time of report generation.")
+
+    doc.add_heading("Full Control Detail", level=1)
+    dtable = doc.add_table(rows=1, cols=5)
+    dtable.style = "Light Grid Accent 1"
+    dhdr = dtable.rows[0].cells
+    for idx, label in enumerate(["Item", "Control", "Status", "Severity", "Reference"]):
+        dhdr[idx].text = label
+    for item_id, data in sorted(all_responses.items()):
+        row = dtable.add_row().cells
+        row[0].text = item_id
+        row[1].text = str(data.get("control", ""))
+        row[2].text = str(data.get("status", ""))
+        row[3].text = str(data.get("severity", ""))
+        row[4].text = str(data.get("reference", ""))
+
+    footer_note = doc.add_paragraph()
+    footer_note.add_run(
+        "\nThis report reflects a point-in-time assessment. Severity ratings "
+        "and framework mappings are generated by rule-based classification "
+        "and should be confirmed by the assigned reviewer before client "
+        "delivery."
+    ).italic = True
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
 
 # ---------------------------------------------------------------------------
 # 1. CHECKLIST DATA
@@ -405,6 +591,17 @@ if "responses" not in st.session_state:
 if "client_name" not in st.session_state:
     st.session_state.client_name = ""
 
+if "custom_checklists" not in st.session_state:
+    # technologies drafted via the AI "add new technology" feature this session.
+    # key: technology name -> list of (item_id, category, control, reference, audit_step)
+    st.session_state.custom_checklists = {}
+
+if "exec_summary" not in st.session_state:
+    st.session_state.exec_summary = ""
+
+# Built-in + any AI-drafted technologies, merged for use everywhere below
+ALL_CHECKLISTS = {**CHECKLISTS, **st.session_state.custom_checklists}
+
 # ---------------------------------------------------------------------------
 # 3. SIDEBAR - client & technology setup, import/export
 # ---------------------------------------------------------------------------
@@ -412,7 +609,63 @@ if "client_name" not in st.session_state:
 st.sidebar.title("⚙️ Engagement Setup")
 st.session_state.client_name = st.sidebar.text_input("Client / Engagement name", value=st.session_state.client_name)
 reviewer = st.sidebar.text_input("Reviewer name", value="")
-tech = st.sidebar.selectbox("Technology to assess", list(CHECKLISTS.keys()))
+tech = st.sidebar.selectbox("Technology to assess", list(ALL_CHECKLISTS.keys()))
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🤖 Add a new technology with AI")
+if not ai_enabled():
+    st.sidebar.caption("Configure a Hugging Face token under [huggingface] in secrets to enable this.")
+else:
+    new_tech_name = st.sidebar.text_input("Technology name", placeholder="e.g. Kong API Gateway", key="new_tech_input")
+    if st.sidebar.button("🤖 Draft checklist with AI", use_container_width=True):
+        if not new_tech_name.strip():
+            st.sidebar.warning("Enter a technology name first.")
+        else:
+            with st.sidebar.status("Drafting checklist...", expanded=False):
+                draft_prompt = f"""You are a senior GRC/OffSec consultant. Draft a hardening/configuration
+checklist for: {new_tech_name}
+
+Return ONLY valid JSON, no markdown fences, no commentary, in this exact shape:
+{{
+  "has_cis_benchmark": true/false,
+  "items": [
+    {{"category": "...", "control": "...", "reference": "CIS x.x or framework name", "audit_step": "specific command/GUI path to verify this", "severity": "Critical|High|Medium|Low"}}
+  ]
+}}
+Produce 10-15 items across a sensible spread of categories (access control,
+logging, network/encryption, patching, hardening). If no formal CIS Benchmark
+exists for this technology, set has_cis_benchmark to false and base items on
+the vendor's own security guide or general best practice (NIST/OWASP),
+labeling the reference field accordingly. Be specific and technical."""
+                raw = ask_ai(draft_prompt, system="You output only raw JSON, never prose or markdown fences.")
+
+            if raw.startswith("⚠️"):
+                st.sidebar.error(raw)
+            else:
+                try:
+                    cleaned = raw.strip()
+                    if cleaned.startswith("```"):
+                        cleaned = cleaned.strip("`")
+                        cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
+                    parsed = json.loads(cleaned)
+                    prefix = "".join(w[0] for w in new_tech_name.upper().split())[:3] or "CU"
+                    items = []
+                    for idx, it in enumerate(parsed.get("items", []), start=1):
+                        items.append((
+                            f"{prefix}-{idx}",
+                            it.get("category", "General"),
+                            it.get("control", ""),
+                            it.get("reference", "AI-drafted, unverified"),
+                            it.get("audit_step", "Manually determine verification method"),
+                        ))
+                    label = f"{new_tech_name} (AI-drafted — review before client use)"
+                    st.session_state.custom_checklists[label] = items
+                    st.sidebar.success(f"Drafted {len(items)} controls for {new_tech_name}. Select it above.")
+                    st.rerun()
+                except (json.JSONDecodeError, KeyError, AttributeError) as e:
+                    st.sidebar.error(f"Couldn't parse AI response as a checklist: {e}")
+                    with st.sidebar.expander("Raw AI output"):
+                        st.code(raw)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("💾 Save / Load Progress")
@@ -483,14 +736,19 @@ st.sidebar.caption(
 st.title("🛡️ Security Configuration & CIS Compliance Tool")
 st.caption(f"Client: **{st.session_state.client_name or '—'}**  |  Technology: **{tech}**")
 
-tab_checklist, tab_dashboard = st.tabs(["📋 Checklist", "📊 Compliance Dashboard"])
+tab_checklist, tab_dashboard, tab_engagements = st.tabs(
+    ["📋 Checklist", "📊 Compliance Dashboard", "📁 Engagements"]
+)
 
-items = CHECKLISTS[tech]
+items = ALL_CHECKLISTS[tech]
 categories = sorted(set(c for _, c, _, _, _ in items))
+
+SEVERITY_BADGE = {"Critical": "🔴", "High": "🟠", "Medium": "🟡", "Low": "⚪"}
 
 with tab_checklist:
     st.subheader("Configuration Checklist")
     filter_status = st.multiselect("Filter by status", STATUS_OPTIONS, default=[])
+    filter_severity = st.multiselect("Filter by severity", list(SEVERITY_WEIGHTS.keys()), default=[])
     search = st.text_input("Search controls", "")
 
     for cat in categories:
@@ -502,6 +760,13 @@ with tab_checklist:
 
         with st.expander(f"**{cat}**  ({len(cat_items)} controls)", expanded=False):
             for item_id, category, control, ref, audit_step in cat_items:
+                classification = classify_control(category, control)
+                severity = classification["severity"]
+                frameworks = classification["frameworks"]
+
+                if filter_severity and severity not in filter_severity:
+                    continue
+
                 existing = st.session_state.responses.get(item_id, {})
                 current_status = existing.get("status", "Not Reviewed")
                 if filter_status and current_status not in filter_status:
@@ -509,9 +774,11 @@ with tab_checklist:
 
                 col1, col2 = st.columns([3, 1])
                 with col1:
-                    st.markdown(f"**{item_id}** — {control}")
+                    st.markdown(f"**{item_id}** — {control}  {SEVERITY_BADGE.get(severity, '')} `{severity}`")
                     st.caption(f"Reference: {ref}")
                     st.markdown(f"🔍 **Audit step:** {audit_step}")
+                    fw_line = " · ".join(f"**{k}:** {v}" for k, v in frameworks.items())
+                    st.caption(f"Framework mapping: {fw_line}")
                 with col2:
                     status = st.selectbox(
                         "Status", STATUS_OPTIONS,
@@ -525,6 +792,28 @@ with tab_checklist:
                     placeholder="Evidence collected, deviation justification, remediation owner/date...",
                 )
 
+                if ai_enabled():
+                    if st.button("🤖 Suggest verdict from evidence above", key=f"ai_verdict_{item_id}"):
+                        if not notes.strip():
+                            st.warning("Paste command output or evidence in the notes field first.")
+                        else:
+                            with st.spinner("Analyzing evidence..."):
+                                verdict_prompt = f"""Control: {control}
+Audit step: {audit_step}
+Evidence/output provided by the reviewer:
+---
+{notes}
+---
+Based only on this evidence, suggest one status: Compliant, Non-Compliant, or
+Compensating Control. Give a one-sentence reason. Format your reply exactly as:
+STATUS: <status>
+REASON: <one sentence>"""
+                            suggestion = ask_ai(verdict_prompt, system="You are a precise security auditor. Never invent evidence not given to you.")
+                            if suggestion.startswith("⚠️"):
+                                st.error(suggestion)
+                            else:
+                                st.info(f"🤖 AI suggestion (confirm before applying): {suggestion}")
+
                 st.session_state.responses[item_id] = {
                     "status": status,
                     "notes": notes,
@@ -532,6 +821,8 @@ with tab_checklist:
                     "control": control,
                     "reference": ref,
                     "audit_step": audit_step,
+                    "severity": severity,
+                    "frameworks": frameworks,
                     "reviewer": reviewer,
                     "date": datetime.now().strftime("%Y-%m-%d"),
                 }
@@ -541,11 +832,26 @@ with tab_dashboard:
     st.subheader("Compliance Dashboard")
 
     all_ids = [it[0] for it in items]
-    recorded = {i: st.session_state.responses.get(i, {"status": "Not Reviewed", "category": next(c for iid, c, _, _, _ in items if iid == i)}) for i in all_ids}
+    item_lookup = {it[0]: it for it in items}
+    recorded = {}
+    for i in all_ids:
+        r = st.session_state.responses.get(i)
+        if r:
+            recorded[i] = r
+        else:
+            _, cat, ctrl, _, _ = item_lookup[i]
+            recorded[i] = {"status": "Not Reviewed", "category": cat, "severity": classify_control(cat, ctrl)["severity"]}
+
     df = pd.DataFrame([
-        {"item_id": i, "category": recorded[i].get("category", ""), "status": recorded[i].get("status", "Not Reviewed")}
+        {
+            "item_id": i,
+            "category": recorded[i].get("category", ""),
+            "status": recorded[i].get("status", "Not Reviewed"),
+            "severity": recorded[i].get("severity") or classify_control(recorded[i].get("category", ""), "")["severity"],
+        }
         for i in all_ids
     ])
+    df["weight"] = df["severity"].map(SEVERITY_WEIGHTS).fillna(1)
 
     total = len(df)
     compliant = (df["status"] == "Compliant").sum()
@@ -556,12 +862,23 @@ with tab_dashboard:
     applicable = total - na
     compliance_pct = round(((compliant + compensating) / applicable) * 100, 1) if applicable else 0.0
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Overall Compliance", f"{compliance_pct}%")
+    applicable_df = df[df["status"] != "Not Applicable"]
+    good_weight = applicable_df[applicable_df["status"].isin(["Compliant", "Compensating Control"])]["weight"].sum()
+    total_weight = applicable_df["weight"].sum()
+    weighted_compliance_pct = round((good_weight / total_weight) * 100, 1) if total_weight else 0.0
+
+    m0, m1, m2, m3, m4, m5 = st.columns(6)
+    m0.metric("Risk-Weighted Compliance", f"{weighted_compliance_pct}%",
+              help="Weighted by severity: Critical×4, High×3, Medium×2, Low×1. A Critical finding moves this more than a Low one.")
+    m1.metric("Raw Compliance", f"{compliance_pct}%", help="Every applicable control counted equally.")
     m2.metric("Compliant", int(compliant))
     m3.metric("Non-Compliant", int(noncompliant))
     m4.metric("Compensating Control", int(compensating))
     m5.metric("Not Reviewed", int(not_reviewed))
+
+    crit_open = df[(df["status"] == "Non-Compliant") & (df["severity"] == "Critical")]
+    if len(crit_open):
+        st.error(f"🔴 {len(crit_open)} Critical-severity control(s) are currently Non-Compliant — prioritize these first.")
 
     st.markdown("---")
 
@@ -602,25 +919,159 @@ with tab_dashboard:
         r = st.session_state.responses.get(i)
         if r and r.get("status") == "Non-Compliant":
             open_items.append({
-                "Item": i, "Category": r.get("category"), "Control": r.get("control"),
-                "Notes": r.get("notes"), "Reference": r.get("reference"), "Audit Step": r.get("audit_step"),
+                "Item": i, "Category": r.get("category"), "Severity": r.get("severity"),
+                "Control": r.get("control"), "Notes": r.get("notes"),
+                "Reference": r.get("reference"), "Audit Step": r.get("audit_step"),
             })
     if open_items:
-        st.dataframe(pd.DataFrame(open_items), use_container_width=True, hide_index=True)
+        open_df = pd.DataFrame(open_items)
+        sev_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+        open_df["_sort"] = open_df["Severity"].map(sev_order).fillna(4)
+        open_df = open_df.sort_values("_sort").drop(columns="_sort")
+        st.dataframe(open_df, use_container_width=True, hide_index=True)
     else:
         st.success("No open non-compliant items recorded yet for this technology.")
 
     st.markdown("---")
-    if st.session_state.responses:
-        full_export = []
-        for item_id, data in st.session_state.responses.items():
-            full_export.append({"item_id": item_id, **data})
-        full_df = pd.DataFrame(full_export)
-        csv_buf2 = io.StringIO()
-        full_df.to_csv(csv_buf2, index=False)
-        st.download_button(
-            "⬇️ Download full compliance report (CSV)",
-            data=csv_buf2.getvalue(),
-            file_name=f"{(st.session_state.client_name or 'client').replace(' ', '_')}_{tech.split(' ')[0]}_compliance_report.csv",
-            mime="text/csv",
+    st.markdown("**🧭 Framework cross-mapping**")
+    st.caption("Rule-based mapping from control category to framework clause — a starting point for cross-framework reporting, confirm against the actual framework text before client delivery.")
+    fw_rows = []
+    for i in all_ids:
+        r = st.session_state.responses.get(i) or {}
+        fw = r.get("frameworks") or classify_control(r.get("category", ""), r.get("control", ""))["frameworks"]
+        fw_rows.append({"Item": i, "Category": r.get("category", ""), **fw})
+    st.dataframe(pd.DataFrame(fw_rows).drop_duplicates(subset="Category"), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("**🤖 AI-assisted reporting**")
+    if not ai_enabled():
+        st.caption("Configure a Hugging Face token under [huggingface] in secrets to enable executive summary generation and natural-language Q&A.")
+    else:
+        ai_col1, ai_col2 = st.columns(2)
+        with ai_col1:
+            if st.button("🤖 Generate Executive Summary", use_container_width=True):
+                with st.spinner("Drafting summary..."):
+                    top_findings = open_df.head(5).to_dict("records") if open_items else []
+                    summary_prompt = f"""Write a concise executive summary (150-250 words) for a security
+configuration assessment.
+Client: {st.session_state.client_name or 'the client'}
+Technology assessed: {tech}
+Risk-weighted compliance score: {weighted_compliance_pct}%
+Total controls: {total}, Non-Compliant: {int(noncompliant)}, Compensating Control: {int(compensating)}, Not Reviewed: {int(not_reviewed)}
+Top open findings (highest severity first): {top_findings}
+
+Write in a professional GRC consulting tone, third person, suitable to paste
+directly into a client report. Cover: overall posture, the most urgent risks,
+and a one-line recommended next step. Do not invent findings not listed above."""
+                    summary = ask_ai(summary_prompt, system="You are a senior GRC consultant writing a client-facing report section.")
+                    if summary.startswith("⚠️"):
+                        st.error(summary)
+                    else:
+                        st.session_state.exec_summary = summary
+        with ai_col2:
+            st.caption("Generated summary is included in the DOCX report export below, and can be edited before export.")
+
+        if st.session_state.exec_summary:
+            st.session_state.exec_summary = st.text_area(
+                "Executive summary (editable — this is what gets exported)",
+                value=st.session_state.exec_summary, height=180,
+            )
+
+        st.markdown("&nbsp;")
+        nl_question = st.text_input("Ask a question about this assessment", placeholder="e.g. Which encryption-related controls are still open?")
+        if st.button("Ask") and nl_question.strip():
+            with st.spinner("Thinking..."):
+                context_rows = [
+                    {"item_id": i, "category": r.get("category"), "status": r.get("status"),
+                     "severity": r.get("severity"), "control": r.get("control"), "notes": r.get("notes")}
+                    for i, r in st.session_state.responses.items()
+                ]
+                qa_prompt = f"""Assessment data for {tech} ({st.session_state.client_name or 'client'}):
+{json.dumps(context_rows)[:6000]}
+
+Question: {nl_question}
+
+Answer using only the data above. If the data doesn't cover the question, say so."""
+                answer = ask_ai(qa_prompt, system="You answer strictly from the provided assessment data, citing item IDs where relevant.")
+                if answer.startswith("⚠️"):
+                    st.error(answer)
+                else:
+                    st.info(answer)
+
+    st.markdown("---")
+    st.markdown("**📄 Export**")
+    exp_col1, exp_col2 = st.columns(2)
+    with exp_col1:
+        if st.session_state.responses:
+            full_export = []
+            for item_id, data in st.session_state.responses.items():
+                full_export.append({"item_id": item_id, **data})
+            full_df = pd.DataFrame(full_export)
+            csv_buf2 = io.StringIO()
+            full_df.to_csv(csv_buf2, index=False)
+            st.download_button(
+                "⬇️ Download full compliance report (CSV)",
+                data=csv_buf2.getvalue(),
+                file_name=f"{(st.session_state.client_name or 'client').replace(' ', '_')}_{tech.split(' ')[0]}_compliance_report.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+    with exp_col2:
+        if st.session_state.responses:
+            docx_bytes = build_docx_report(
+                client_name=st.session_state.client_name or "Client",
+                technology=tech,
+                reviewer_name=reviewer,
+                weighted_pct=weighted_compliance_pct,
+                raw_pct=compliance_pct,
+                totals={"total": total, "compliant": int(compliant), "noncompliant": int(noncompliant),
+                        "compensating": int(compensating), "not_reviewed": int(not_reviewed)},
+                open_items=open_items,
+                exec_summary=st.session_state.exec_summary,
+                all_responses=st.session_state.responses,
+            )
+            st.download_button(
+                "⬇️ Download client report (DOCX)",
+                data=docx_bytes,
+                file_name=f"{(st.session_state.client_name or 'client').replace(' ', '_')}_{tech.split(' ')[0]}_report.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+            )
+
+with tab_engagements:
+    st.subheader("Engagements")
+    if not cloud_persistence_enabled():
+        st.info(
+            "Engagement listing requires cloud persistence (Google Sheets) to be configured, "
+            "since each engagement is stored as a tab in the shared sheet. See README.md."
         )
+    else:
+        try:
+            gc = get_gsheet_client()
+            sh = gc.open_by_key(st.secrets["gsheets"]["sheet_id"])
+            worksheets = sh.worksheets()
+            rows = []
+            for ws in worksheets:
+                name = ws.title
+                if "__" in name:
+                    client_part, tech_part = name.split("__", 1)
+                else:
+                    client_part, tech_part = name, ""
+                try:
+                    row_count = max(ws.row_count - 1, 0)
+                    records = ws.get_all_records()
+                    nc = sum(1 for r in records if r.get("status") == "Non-Compliant")
+                except Exception:
+                    records, nc = [], 0
+                rows.append({
+                    "Client": client_part, "Technology": tech_part,
+                    "Controls Recorded": len(records), "Open Non-Compliant": nc,
+                })
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.caption("Select a client + technology in the sidebar and click '☁️ Load from cloud' to resume any of these engagements.")
+            else:
+                st.info("No engagements saved yet. Save progress from the sidebar to see it listed here.")
+        except Exception as e:
+            st.error(f"Could not list engagements: {e}")
