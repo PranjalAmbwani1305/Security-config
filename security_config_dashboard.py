@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 from datetime import datetime
 import io
 import json
@@ -20,15 +21,43 @@ try:
 except ImportError:
     GSPREAD_AVAILABLE = False
 
+try:
+    from huggingface_hub import InferenceClient
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+
 SHEETS_SCOPE = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+ACTIVITY_TAB = "_activity_log"
+LIBRARY_TAB = "_checklist_library"
+DEFAULT_HF_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
+# ---------------------------------------------------------------------------
+# TEAM / IDENTITY
+# Configure real reviewer names in secrets.toml:
+#   [team]
+#   members = ["Jane Doe", "Alex Rivera", "Priya Nair"]
+# Falls back to three generic seats so the app runs out of the box.
+# ---------------------------------------------------------------------------
+
+def get_team_members():
+    configured = st.secrets.get("team", {}).get("members", None)
+    if configured and len(configured) > 0:
+        return list(configured)
+    return ["Reviewer 1", "Reviewer 2", "Reviewer 3"]
+
+
+# ---------------------------------------------------------------------------
+# GOOGLE SHEETS - shared, multi-user persistence layer
+# One spreadsheet, one tab per client__technology engagement, plus a single
+# _activity_log tab so every seat can see who changed what, when.
+# ---------------------------------------------------------------------------
 
 @st.cache_resource(show_spinner=False)
 def get_gsheet_client():
-    """Build an authorized gspread client from Streamlit secrets, if configured."""
     if not GSPREAD_AVAILABLE:
         return None
     if "gcp_service_account" not in st.secrets or "sheet_id" not in st.secrets.get("gsheets", {}):
@@ -44,13 +73,18 @@ def cloud_persistence_enabled() -> bool:
 
 
 def _sheet_tab_name(client_name: str, technology: str) -> str:
-    # Sheet tab names are capped at 100 chars and can't contain some symbols.
     raw = f"{client_name}__{technology}".strip() or "untitled"
     safe = "".join(c for c in raw if c.isalnum() or c in ("_", "-", " "))
     return safe[:95]
 
 
-def save_to_cloud(client_name: str, technology: str, responses: dict) -> None:
+RESPONSE_COLUMNS = [
+    "item_id", "category", "control", "reference", "audit_step", "status",
+    "severity", "notes", "assigned_to", "last_updated_by", "last_updated_at",
+]
+
+
+def save_to_cloud(client_name: str, technology: str, responses: dict, actor: str) -> None:
     gc = get_gsheet_client()
     if gc is None:
         return
@@ -60,22 +94,13 @@ def save_to_cloud(client_name: str, technology: str, responses: dict) -> None:
         ws = sh.worksheet(tab_name)
         ws.clear()
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=tab_name, rows=200, cols=10)
+        ws = sh.add_worksheet(title=tab_name, rows=max(200, len(responses) + 20), cols=len(RESPONSE_COLUMNS) + 2)
 
-    rows = [["item_id", "category", "control", "reference", "audit_step", "status", "notes", "reviewer", "date"]]
+    rows = [RESPONSE_COLUMNS]
     for item_id, data in responses.items():
-        rows.append([
-            item_id,
-            data.get("category", ""),
-            data.get("control", ""),
-            data.get("reference", ""),
-            data.get("audit_step", ""),
-            data.get("status", ""),
-            data.get("notes", ""),
-            data.get("reviewer", ""),
-            data.get("date", ""),
-        ])
+        rows.append([item_id] + [str(data.get(col, "") or "") for col in RESPONSE_COLUMNS[1:]])
     ws.update(rows)
+    log_activity(sh, actor, client_name, technology, f"Saved {len(responses)} control(s) to the shared workspace.")
 
 
 def load_from_cloud(client_name: str, technology: str) -> dict:
@@ -102,29 +127,142 @@ def load_from_cloud(client_name: str, technology: str) -> dict:
             "control": row.get("control", ""),
             "reference": row.get("reference", ""),
             "audit_step": row.get("audit_step", ""),
-            "reviewer": row.get("reviewer", ""),
-            "date": row.get("date", ""),
+            "severity": row.get("severity", ""),
+            "assigned_to": row.get("assigned_to", ""),
+            "last_updated_by": row.get("last_updated_by", ""),
+            "last_updated_at": row.get("last_updated_at", ""),
         }
     return loaded
 
 
+def log_activity(sh, actor, client_name, technology, message):
+    try:
+        try:
+            log_ws = sh.worksheet(ACTIVITY_TAB)
+        except gspread.WorksheetNotFound:
+            log_ws = sh.add_worksheet(title=ACTIVITY_TAB, rows=500, cols=5)
+            log_ws.update([["timestamp", "user", "client", "technology", "action"]])
+        log_ws.append_row([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), actor, client_name, technology, message,
+        ])
+    except Exception:
+        pass  # activity logging is best-effort and must never block a save
+
+
+def fetch_activity_log(limit=25):
+    gc = get_gsheet_client()
+    if gc is None:
+        return []
+    sh = gc.open_by_key(st.secrets["gsheets"]["sheet_id"])
+    try:
+        log_ws = sh.worksheet(ACTIVITY_TAB)
+    except gspread.WorksheetNotFound:
+        return []
+    records = log_ws.get_all_records()
+    return list(reversed(records))[:limit]
+
+
+def list_client_engagements(client_name: str):
+    """Return per-technology rollups for every tab belonging to this client."""
+    gc = get_gsheet_client()
+    if gc is None:
+        return []
+    sh = gc.open_by_key(st.secrets["gsheets"]["sheet_id"])
+    prefix = f"{client_name}__"
+    out = []
+    for ws in sh.worksheets():
+        if ws.title == ACTIVITY_TAB or not ws.title.startswith(prefix):
+            continue
+        technology = ws.title[len(prefix):]
+        try:
+            records = ws.get_all_records()
+        except Exception:
+            continue
+        if not records:
+            continue
+        df = pd.DataFrame(records)
+        df["weight"] = df["severity"].map(SEVERITY_WEIGHTS).fillna(1)
+        applicable = df[df["status"] != "Not Applicable"]
+        good = applicable[applicable["status"].isin(["Compliant", "Compensating Control"])]
+        weighted_pct = round((good["weight"].sum() / applicable["weight"].sum()) * 100, 1) if len(applicable) else 0.0
+        crit_open = int(((df["status"] == "Non-Compliant") & (df["severity"] == "Critical")).sum())
+        out.append({
+            "technology": technology,
+            "controls": len(df),
+            "weighted_compliance": weighted_pct,
+            "non_compliant": int((df["status"] == "Non-Compliant").sum()),
+            "critical_open": crit_open,
+            "not_reviewed": int((df["status"] == "Not Reviewed").sum()),
+        })
+    return sorted(out, key=lambda x: x["weighted_compliance"])
+
+
 # ---------------------------------------------------------------------------
-# HUGGING FACE - AI-assisted features
-# Uses huggingface_hub.InferenceClient against a chat-capable instruct model.
-# Configure via Streamlit secrets:
-#   [huggingface]
-#   api_key = "hf_xxx"
-#   model = "meta-llama/Llama-3.1-8B-Instruct"   # optional, has a default
+# CHECKLIST LIBRARY - the "client brought a technology we don't have yet"
+# problem. Any AI-drafted or manually-typed checklist is written to a single
+# shared _checklist_library tab so it becomes a PERMANENT addition to the
+# platform for every reviewer, not just something that exists for the rest
+# of one browser session. On startup every seat pulls the current library
+# and it's merged on top of the built-in CHECKLISTS.
 # ---------------------------------------------------------------------------
 
-try:
-    from huggingface_hub import InferenceClient
-    HF_AVAILABLE = True
-except ImportError:
-    HF_AVAILABLE = False
+LIBRARY_COLUMNS = ["technology", "item_id", "category", "control", "reference", "audit_step", "source", "added_by", "added_at"]
 
-DEFAULT_HF_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
+def save_checklist_to_library(technology: str, items: list, source: str, actor: str) -> None:
+    """items: list of (item_id, category, control, reference, audit_step) tuples."""
+    gc = get_gsheet_client()
+    if gc is None:
+        return
+    sh = gc.open_by_key(st.secrets["gsheets"]["sheet_id"])
+    try:
+        ws = sh.worksheet(LIBRARY_TAB)
+        existing = ws.get_all_records()
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=LIBRARY_TAB, rows=1000, cols=len(LIBRARY_COLUMNS) + 2)
+        ws.update([LIBRARY_COLUMNS])
+        existing = []
+
+    # Drop any prior rows for this exact technology name (re-drafts overwrite), keep everything else.
+    keep_rows = [LIBRARY_COLUMNS] + [
+        [r.get(c, "") for c in LIBRARY_COLUMNS] for r in existing if r.get("technology") != technology
+    ]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    new_rows = [
+        [technology, item_id, category, control, reference, audit_step, source, actor, now]
+        for item_id, category, control, reference, audit_step in items
+    ]
+    ws.clear()
+    ws.update(keep_rows + new_rows)
+    log_activity(sh, actor, "—", technology, f"Added '{technology}' to the shared checklist library ({len(items)} controls, {source}).")
+
+
+def load_checklist_library() -> dict:
+    """Returns {technology_display_name: [(item_id, category, control, reference, audit_step), ...]}."""
+    gc = get_gsheet_client()
+    if gc is None:
+        return {}
+    sh = gc.open_by_key(st.secrets["gsheets"]["sheet_id"])
+    try:
+        ws = sh.worksheet(LIBRARY_TAB)
+    except gspread.WorksheetNotFound:
+        return {}
+    records = ws.get_all_records()
+    out = {}
+    for r in records:
+        tech = r.get("technology")
+        if not tech:
+            continue
+        out.setdefault(tech, []).append((
+            r.get("item_id", ""), r.get("category", ""), r.get("control", ""),
+            r.get("reference", ""), r.get("audit_step", ""),
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# HUGGING FACE - AI-assisted drafting, verdicts, summaries, Q&A
+# ---------------------------------------------------------------------------
 
 @st.cache_resource(show_spinner=False)
 def get_hf_client():
@@ -144,9 +282,6 @@ def ai_enabled() -> bool:
 
 
 def ask_ai(prompt: str, system: str = "", max_tokens: int = 900) -> str:
-    """Send a chat completion request to the configured HF model. Returns the
-    text response, or an error string prefixed with '⚠️' on failure — callers
-    should check for that prefix before treating the result as trustworthy."""
     client = get_hf_client()
     if client is None:
         return "⚠️ AI features are not configured. Add a Hugging Face token under [huggingface] in Streamlit secrets."
@@ -161,15 +296,73 @@ def ask_ai(prompt: str, system: str = "", max_tokens: int = 900) -> str:
         return f"⚠️ AI request failed: {e}"
 
 
-st.set_page_config(page_title="Security Config & CIS Compliance Tool", layout="wide")
+st.set_page_config(page_title="Sentinel GRC | Security Configuration & Compliance Platform", layout="wide", page_icon="🛡️")
+
+# ---------------------------------------------------------------------------
+# THEME - dark, professional GRC-console styling
+# ---------------------------------------------------------------------------
+
+st.markdown("""
+<style>
+#MainMenu, footer, header {visibility: hidden;}
+.stApp {
+    background: linear-gradient(180deg, #0b1120 0%, #0f172a 100%);
+}
+h1, h2, h3, h4 { color: #e2e8f0 !important; letter-spacing: -0.01em; }
+p, li, span, label, .stMarkdown { color: #cbd5e1; }
+.stCaption, [data-testid="stCaptionContainer"] { color: #64748b !important; }
+
+.hero-banner {
+    background: linear-gradient(120deg, #0f172a 0%, #1e293b 60%, #0f172a 100%);
+    border: 1px solid #1e293b;
+    border-radius: 14px;
+    padding: 22px 28px;
+    margin-bottom: 18px;
+    box-shadow: 0 0 0 1px rgba(56,189,248,0.06), 0 8px 24px rgba(0,0,0,0.35);
+}
+.hero-title { font-size: 26px; font-weight: 700; color: #f1f5f9; margin: 0; }
+.hero-sub { font-size: 13.5px; color: #7dd3fc; margin-top: 4px; font-weight: 500; letter-spacing: 0.02em; text-transform: uppercase; }
+.hero-meta { font-size: 13px; color: #94a3b8; margin-top: 10px; }
+.hero-meta b { color: #e2e8f0; }
+
+[data-testid="stMetric"] {
+    background: #111827;
+    border: 1px solid #1f2937;
+    border-radius: 10px;
+    padding: 12px 14px 8px 14px;
+}
+[data-testid="stMetricLabel"] { color: #94a3b8 !important; }
+[data-testid="stMetricValue"] { color: #f1f5f9 !important; }
+
+section[data-testid="stSidebar"] {
+    background: #0b1120;
+    border-right: 1px solid #1e293b;
+}
+.badge {
+    display: inline-block; padding: 2px 9px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.02em;
+}
+.badge-you { background: rgba(56,189,248,0.15); color: #7dd3fc; border: 1px solid rgba(56,189,248,0.35); }
+.audit-step {
+    background: #0b1120; border: 1px solid #1e293b; border-radius: 6px;
+    padding: 6px 10px; font-family: 'SFMono-Regular', Consolas, monospace;
+    font-size: 12.5px; color: #a5b4fc; margin: 4px 0;
+}
+div[data-testid="stExpander"] {
+    background: #0f172a; border: 1px solid #1e293b !important; border-radius: 10px;
+}
+hr { border-color: #1e293b; }
+</style>
+""", unsafe_allow_html=True)
+
+TEAM_MEMBERS = get_team_members()
 
 # ---------------------------------------------------------------------------
 # CONTROL CLASSIFICATION - severity + compliance-framework cross-mapping
 # Rule-based on category/control keywords rather than hand-tagged per item.
-# This is a starting point a reviewer should confirm before client delivery,
-# same as the CIS section references elsewhere in this tool - keyword rules
-# can misclassify an unusual control, so treat this as triage, not a final
-# audit opinion.
+# This is a starting point a reviewer should confirm before client delivery -
+# keyword rules can misclassify an unusual control, so treat this as triage,
+# not a final audit opinion.
 # ---------------------------------------------------------------------------
 
 SEVERITY_WEIGHTS = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
@@ -215,7 +408,6 @@ def classify_control(category: str, control: str) -> dict:
 
 def build_docx_report(client_name, technology, reviewer_name, weighted_pct, raw_pct,
                        totals, open_items, exec_summary, all_responses) -> bytes:
-    """Build a client-facing DOCX report. Returns raw bytes for st.download_button."""
     if not DOCX_AVAILABLE:
         return b""
 
@@ -228,7 +420,7 @@ def build_docx_report(client_name, technology, reviewer_name, weighted_pct, raw_
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
     meta.add_run(f"Client: {client_name}\n").bold = True
     meta.add_run(f"Technology Assessed: {technology}\n")
-    meta.add_run(f"Reviewer: {reviewer_name or '—'}\n")
+    meta.add_run(f"Lead Reviewer: {reviewer_name or '—'}\n")
     meta.add_run(f"Report Date: {datetime.now().strftime('%Y-%m-%d')}")
 
     doc.add_page_break()
@@ -265,10 +457,10 @@ def build_docx_report(client_name, technology, reviewer_name, weighted_pct, raw_
     if open_items:
         sev_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
         sorted_items = sorted(open_items, key=lambda x: sev_order.get(x.get("Severity"), 4))
-        ftable = doc.add_table(rows=1, cols=5)
+        ftable = doc.add_table(rows=1, cols=6)
         ftable.style = "Light Grid Accent 1"
         fhdr = ftable.rows[0].cells
-        for idx, label in enumerate(["Item", "Severity", "Control", "Audit Step", "Notes"]):
+        for idx, label in enumerate(["Item", "Severity", "Control", "Audit Step", "Notes", "Owner"]):
             fhdr[idx].text = label
         for it in sorted_items:
             row = ftable.add_row().cells
@@ -277,14 +469,15 @@ def build_docx_report(client_name, technology, reviewer_name, weighted_pct, raw_
             row[2].text = str(it.get("Control", ""))
             row[3].text = str(it.get("Audit Step", ""))
             row[4].text = str(it.get("Notes", "") or "")
+            row[5].text = str(it.get("Assigned", "") or "Unassigned")
     else:
         doc.add_paragraph("No open Non-Compliant findings at time of report generation.")
 
     doc.add_heading("Full Control Detail", level=1)
-    dtable = doc.add_table(rows=1, cols=5)
+    dtable = doc.add_table(rows=1, cols=6)
     dtable.style = "Light Grid Accent 1"
     dhdr = dtable.rows[0].cells
-    for idx, label in enumerate(["Item", "Control", "Status", "Severity", "Reference"]):
+    for idx, label in enumerate(["Item", "Control", "Status", "Severity", "Reference", "Reviewed By"]):
         dhdr[idx].text = label
     for item_id, data in sorted(all_responses.items()):
         row = dtable.add_row().cells
@@ -293,6 +486,7 @@ def build_docx_report(client_name, technology, reviewer_name, weighted_pct, raw_
         row[2].text = str(data.get("status", ""))
         row[3].text = str(data.get("severity", ""))
         row[4].text = str(data.get("reference", ""))
+        row[5].text = str(data.get("last_updated_by", "") or "")
 
     footer_note = doc.add_paragraph()
     footer_note.add_run(
@@ -310,11 +504,10 @@ def build_docx_report(client_name, technology, reviewer_name, weighted_pct, raw_
 # ---------------------------------------------------------------------------
 # 1. CHECKLIST DATA
 # Each technology maps to a list of controls: id, category, control text,
-# guidance, and a rough CIS Benchmark cross-reference (where a formal CIS
-# Benchmark exists for that technology). For technologies without a
-# published CIS Benchmark, the list is a generic best-practice checklist
-# built from common hardening/compliance frameworks (NIST, ISO 27001,
-# vendor hardening guides) rather than a specific named source.
+# CIS/framework cross-reference, and the specific audit step used to verify
+# it. Where no formal published CIS Benchmark exists for a technology, the
+# checklist is built from the vendor's own hardening guide or general
+# best-practice frameworks (NIST, OWASP) instead, and labeled accordingly.
 # ---------------------------------------------------------------------------
 
 CHECKLISTS = {
@@ -335,7 +528,7 @@ CHECKLISTS = {
         ("L-14", "Access, Authentication & Authorization", "Password complexity, history, and lockout policy enforced via pam_pwquality/faillock", "CIS 5.3.x", "cat /etc/security/pwquality.conf /etc/security/faillock.conf"),
         ("L-15", "Access, Authentication & Authorization", "SSH root login disabled, protocol 2 only, strong ciphers/MACs only", "CIS 5.2.x", "sshd -T | grep -Ei 'permitrootlogin|protocol|ciphers|macs'"),
         ("L-16", "Access, Authentication & Authorization", "sudo requires password and logs all sudo activity", "CIS 5.4.x", "cat /etc/sudoers /etc/sudoers.d/*  and  grep sudo /var/log/secure  (RHEL) or /var/log/auth.log (Debian)"),
-        ("L-17", "Access, Authentication & Authorization", "Empty passwords, unused/system accounts are locked or removed", "CIS 5.5.x", "awk -F: '($2 == '') {print $1}' /etc/shadow  and  passwd -Sa"),
+        ("L-17", "Access, Authentication & Authorization", "Empty passwords, unused/system accounts are locked or removed", "CIS 5.5.x", "awk -F: '($2 == \"\") {print $1}' /etc/shadow  and  passwd -Sa"),
         ("L-18", "System Maintenance", "World-writable files and unowned files/directories are found and remediated", "CIS 6.1.x", "find / -xdev -type f -perm -0002 2>/dev/null"),
         ("L-19", "System Maintenance", "Permissions on /etc/passwd, /etc/shadow, /etc/gshadow are correctly restricted", "CIS 6.1.x", "stat -c '%a %U:%G %n' /etc/passwd /etc/shadow /etc/gshadow"),
         ("L-20", "System Maintenance", "OS and package patching cadence is documented and current", "CIS 1.9 / general", "yum history  (RHEL) or apt list --upgradable  (Debian), cross-checked against the patch management ticket/SOP"),
@@ -409,13 +602,13 @@ CHECKLISTS = {
         ("MY-1", "Installation & Patching", "Running a currently supported MySQL version; unused example/test databases removed", "CIS 1.x", "mysql -e 'SELECT VERSION(); SHOW DATABASES;'  (check for a leftover 'test' database)"),
         ("MY-2", "Installation & Patching", "MySQL service runs under a dedicated non-root OS account", "CIS 1.x", "ps -ef | grep mysqld  — confirm the running OS user is not root"),
         ("MY-3", "File Permissions", "Data directory and my.cnf permissions restricted to the mysql OS user only", "CIS 2.x", "ls -la /var/lib/mysql /etc/my.cnf"),
-        ("MY-4", "File Permissions", "Error/general logs are not world-readable", "CIS 2.x", "mysql -e 'SHOW VARIABLES LIKE 'log_error';'  then  ls -la <path returned>"),
-        ("MY-5", "General & Network", "TLS is enabled and required for client connections (require_secure_transport)", "CIS 3.x", "mysql -e 'SHOW VARIABLES LIKE 'require_secure_transport';'"),
-        ("MY-6", "General & Network", "local_infile is disabled unless explicitly required", "CIS 3.x", "mysql -e 'SHOW VARIABLES LIKE 'local_infile';'"),
+        ("MY-4", "File Permissions", "Error/general logs are not world-readable", "CIS 2.x", "mysql -e \"SHOW VARIABLES LIKE 'log_error';\"  then  ls -la <path returned>"),
+        ("MY-5", "General & Network", "TLS is enabled and required for client connections (require_secure_transport)", "CIS 3.x", "mysql -e \"SHOW VARIABLES LIKE 'require_secure_transport';\""),
+        ("MY-6", "General & Network", "local_infile is disabled unless explicitly required", "CIS 3.x", "mysql -e \"SHOW VARIABLES LIKE 'local_infile';\""),
         ("MY-7", "Authentication", "Default/anonymous accounts are removed or locked; root account has a strong password", "CIS 4.x", "mysql -e 'SELECT User,Host FROM mysql.user;'"),
-        ("MY-8", "Authentication", "Password validation plugin enforces complexity, history and expiration", "CIS 4.x", "mysql -e 'SHOW VARIABLES LIKE 'validate_password%';'"),
+        ("MY-8", "Authentication", "Password validation plugin enforces complexity, history and expiration", "CIS 4.x", "mysql -e \"SHOW VARIABLES LIKE 'validate_password%';\""),
         ("MY-9", "Authorization", "SUPER, FILE, and PROCESS privileges are limited to admin/service accounts only", "CIS 4.x", "mysql -e 'SELECT User,Host,Super_priv,File_priv FROM mysql.user;'"),
-        ("MY-10", "Auditing", "Audit plugin or general query log captures security-relevant events", "CIS 6.x", "mysql -e 'SHOW PLUGINS;'  (check audit_log)  or  'SHOW VARIABLES LIKE 'general_log%';'"),
+        ("MY-10", "Auditing", "Audit plugin or general query log captures security-relevant events", "CIS 6.x", "mysql -e 'SHOW PLUGINS;'  (check audit_log)  or  \"SHOW VARIABLES LIKE 'general_log%';\""),
         ("MY-11", "Auditing", "Logs are forwarded to a central log server/SIEM", "CIS 6.x", "Check the rsyslog/Filebeat configuration shipping MySQL logs to the central SIEM"),
         ("MY-12", "Replication", "Replication traffic between source and replicas is encrypted, if replication is used", "CIS 7.x", "mysql -e 'SHOW SLAVE STATUS\\G'  (check Master_SSL_Allowed)"),
     ],
@@ -569,6 +762,76 @@ CHECKLISTS = {
         ("PM-11", "Integration", "PAM integrated with SSO/IdP and ticketing so privileged access ties to a documented business justification", "General PAM best practice", "Review the IdP integration configuration and the ticket-linkage field in the access-request workflow"),
         ("PM-12", "Segregation", "PAM platform's own admin accounts are separate from the accounts it manages, with restricted vault console access", "General PAM best practice", "Review the PAM platform's own admin role assignments against the safes/permissions it manages"),
     ],
+    # -------------------------------------------------------------------
+    # Newly added technologies
+    # -------------------------------------------------------------------
+    "Redis (CIS Benchmark based)": [
+        ("RD-1", "Network & Access", "Redis is bound to a private interface / protected by firewall, not exposed to 0.0.0.0 publicly", "CIS Redis Benchmark", "redis-cli CONFIG GET bind  and  netstat -tulpn | grep 6379"),
+        ("RD-2", "Authentication", "requirepass (or ACLs in Redis 6+) is set with a strong, unique password", "CIS Redis Benchmark", "redis-cli CONFIG GET requirepass  or  redis-cli ACL LIST"),
+        ("RD-3", "Authorization", "Dangerous commands (FLUSHALL, CONFIG, KEYS, SHUTDOWN) are renamed or disabled in production", "CIS Redis Benchmark", "grep -i rename-command /etc/redis/redis.conf"),
+        ("RD-4", "Transport Security", "TLS is enabled for client and replication traffic", "CIS Redis Benchmark", "redis-cli CONFIG GET tls-port  and  grep -i tls /etc/redis/redis.conf"),
+        ("RD-5", "Process Security", "Redis runs as a dedicated non-root OS user with a restricted working directory", "CIS Redis Benchmark", "ps -ef | grep redis-server  and check the systemd unit's User= directive"),
+        ("RD-6", "Persistence & Backup", "RDB/AOF persistence files are stored with restricted permissions and backed up per policy", "CIS Redis Benchmark", "ls -la $(redis-cli CONFIG GET dir | tail -1)"),
+        ("RD-7", "Logging", "Logging is enabled at an appropriate verbosity and forwarded to a central log store", "CIS Redis Benchmark", "redis-cli CONFIG GET logfile loglevel"),
+        ("RD-8", "Hardening", "Protected mode is enabled and unused modules are not loaded", "CIS Redis Benchmark", "redis-cli CONFIG GET protected-mode  and  redis-cli MODULE LIST"),
+        ("RD-9", "Resource Limits", "maxmemory and an eviction policy are configured to prevent resource exhaustion", "CIS Redis Benchmark", "redis-cli CONFIG GET maxmemory maxmemory-policy"),
+    ],
+    "MongoDB (CIS Benchmark based)": [
+        ("MG-1", "Authentication", "Access control (authorization: enabled) is enforced; no anonymous access permitted", "CIS MongoDB Benchmark", "mongosh --eval 'db.runCommand({connectionStatus:1})'  and check mongod.conf security.authorization"),
+        ("MG-2", "Authorization", "Role-based access control follows least privilege; built-in root/superuser roles are limited", "CIS MongoDB Benchmark", "db.getRoles({rolesInfo:1, showPrivileges:true})  against admin database"),
+        ("MG-3", "Network", "bindIp restricts listener to required interfaces; not bound to 0.0.0.0 in production", "CIS MongoDB Benchmark", "grep -A2 net: /etc/mongod.conf"),
+        ("MG-4", "Transport Security", "TLS/SSL is enabled for client and intra-cluster (replica set) traffic", "CIS MongoDB Benchmark", "grep -A5 tls: /etc/mongod.conf  or  db.adminCommand({getParameter:1, sslMode:1})"),
+        ("MG-5", "Encryption at Rest", "Storage engine encryption (encryptionKeyFile/KMIP) is enabled for sensitive datasets", "CIS MongoDB Benchmark", "grep -A3 encryption: /etc/mongod.conf"),
+        ("MG-6", "Auditing", "Audit log captures authentication, authorization and CRUD events on sensitive collections", "CIS MongoDB Benchmark", "grep -A3 auditLog: /etc/mongod.conf"),
+        ("MG-7", "Process Security", "mongod/mongos run as a dedicated non-root service account", "CIS MongoDB Benchmark", "ps -ef | grep mongod  and check the systemd unit's User= directive"),
+        ("MG-8", "Backup", "Backups (mongodump/Ops Manager/Atlas snapshots) are encrypted and restore-tested", "General best practice", "Review backup job configuration and the most recent restore-test log"),
+        ("MG-9", "Hardening", "JavaScript execution (server-side scripting) is disabled unless explicitly required", "CIS MongoDB Benchmark", "mongosh --eval 'db.adminCommand({getParameter:1, security.javascriptEnabled:1})'"),
+    ],
+    "VMware vSphere / ESXi (CIS Benchmark based)": [
+        ("VM-1", "Access Control", "ESXi lockdown mode is enabled; direct root login to the host console is restricted", "CIS VMware ESXi Benchmark", "esxcli system security lockdown mode get  or vSphere Client → Host > Configure > Security Profile"),
+        ("VM-2", "Authentication", "vCenter SSO is integrated with a centralized IdP; local ESXi accounts are minimized", "CIS VMware ESXi Benchmark", "vSphere Client → Administration > Single Sign On > Users and Groups"),
+        ("VM-3", "Network", "Management (vMotion, vSAN) traffic is isolated on dedicated, non-routed VLANs", "CIS VMware ESXi Benchmark", "vSphere Client → Networking → review VMkernel adapter port group/VLAN assignment"),
+        ("VM-4", "Logging", "ESXi hosts forward logs to a central syslog server", "CIS VMware ESXi Benchmark", "esxcli system syslog config get  or Host > Configure > System > Advanced System Settings (Syslog.global.logHost)"),
+        ("VM-5", "Patch Management", "Hosts are on a currently supported ESXi build with security patches applied per cadence", "CIS VMware ESXi Benchmark", "esxcli software vib list  compared to VMware's patch/build matrix, or vCenter Lifecycle Manager compliance view"),
+        ("VM-6", "Certificates", "vCenter/ESXi management certificates are valid and not using VMware's default self-signed certs", "CIS VMware ESXi Benchmark", "openssl s_client -connect esxi-host:443  or Host > Configure > Certificate"),
+        ("VM-7", "Hardening", "Unused services (SSH, ESXi Shell) are disabled and only enabled temporarily when required", "CIS VMware ESXi Benchmark", "esxcli system service list | grep -E 'TSM|TSM-SSH'"),
+        ("VM-8", "Snapshots & Backup", "VM backups (via vSphere-aware backup tool) are encrypted and tested; stale snapshots are cleaned up", "General best practice", "Review the backup job configuration and vSphere Client → VMs → Snapshot Manager for aged snapshots"),
+        ("VM-9", "Isolation", "VM-to-VM traffic on shared clipboard/drag-and-drop and other VMX isolation settings are hardened", "CIS VMware ESXi Benchmark", "Review the VM's .vmx file for isolation.tools.copy.disable / isolation.tools.paste.disable settings"),
+    ],
+    "macOS Endpoint (CIS Benchmark based)": [
+        ("MAC-1", "System Updates", "Automatic security updates are enabled and the OS is on a currently supported version", "CIS macOS Benchmark", "softwareupdate --schedule  and  sw_vers  compared against Apple's supported release list"),
+        ("MAC-2", "FileVault", "FileVault full-disk encryption is enabled with a recovery key escrowed centrally (MDM/Jamf)", "CIS macOS Benchmark", "fdesetup status"),
+        ("MAC-3", "Firewall", "Application firewall is enabled with stealth mode on for untrusted networks", "CIS macOS Benchmark", "/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate --getstealthmode"),
+        ("MAC-4", "Gatekeeper & SIP", "Gatekeeper and System Integrity Protection (SIP) are both enabled", "CIS macOS Benchmark", "spctl --status  and  csrutil status"),
+        ("MAC-5", "Authentication", "A screen-saver password and auto-lock timeout are enforced", "CIS macOS Benchmark", "defaults read com.apple.screensaver askForPassword askForPasswordDelay"),
+        ("MAC-6", "MDM Enrollment", "Device is enrolled in MDM (Jamf/Intune/Kandji) with compliance policies actively reporting", "General best practice", "Check the MDM console's device compliance/last-checkin status for the device"),
+        ("MAC-7", "Endpoint Protection", "An EDR/antivirus agent is installed, up to date, and reporting centrally", "General best practice", "Check the EDR console's agent status/last-seen for the device"),
+        ("MAC-8", "Sharing Services", "Remote Login (SSH), Screen Sharing and File Sharing are disabled unless explicitly required", "CIS macOS Benchmark", "sudo systemsetup -getremotelogin  and  System Settings > General > Sharing"),
+        ("MAC-9", "Guest Access", "Guest account and guest access to shared folders are disabled", "CIS macOS Benchmark", "sudo sysadminctl -screenLock status  and  dscl . -read /Users/Guest 2>/dev/null (should fail if disabled)"),
+    ],
+    "Microsoft 365 / Google Workspace (generic - no single CIS benchmark)": [
+        ("SAAS-1", "Identity", "MFA (or passkeys/security keys) is enforced for all users, especially admins", "CIS M365/Workspace Foundations", "M365: Entra ID → Security → Authentication methods. Workspace: Admin console → Security → 2-Step Verification enforcement report"),
+        ("SAAS-2", "Identity", "Legacy/basic authentication protocols are blocked", "CIS M365 Benchmark", "M365: Entra ID → Conditional Access policy blocking legacy auth. Workspace: Admin console → Security → API access controls"),
+        ("SAAS-3", "Admin Roles", "Global/Super Admin role membership is minimized and uses Privileged Identity Management/just-in-time access", "CIS M365/Workspace Foundations", "M365: Entra ID PIM → Global Administrator assignments. Workspace: Admin console → Account → Admin roles"),
+        ("SAAS-4", "Email Security", "SPF, DKIM and DMARC are published and enforced for the organization's domains", "General best practice", "dig TXT <domain>  for SPF/DMARC, and check DKIM signing status in the admin console's domain settings"),
+        ("SAAS-5", "Email Security", "Anti-phishing / safe-links and attachment scanning policies are enabled", "CIS M365/Workspace Foundations", "M365: Defender portal → Policies → Anti-phishing/Safe Links. Workspace: Admin console → Security → Gmail safety settings"),
+        ("SAAS-6", "Data Loss Prevention", "DLP policies are configured for sensitive data types (PII, financial, source code)", "General best practice", "M365: Purview → Data Loss Prevention policies. Workspace: Admin console → Security → Data protection rules"),
+        ("SAAS-7", "External Sharing", "External file/link sharing defaults are restricted (no anonymous 'anyone with the link' by default)", "General best practice", "M365: SharePoint admin center → Sharing settings. Workspace: Admin console → Drive and Docs → Sharing settings"),
+        ("SAAS-8", "Auditing", "Unified audit log / admin audit logging is enabled and retained per policy", "CIS M365/Workspace Foundations", "M365: Purview → Audit search. Workspace: Admin console → Reporting → Audit log"),
+        ("SAAS-9", "Device Access", "Conditional access / context-aware access restricts sign-in to managed, compliant devices", "General best practice", "M365: Entra ID → Conditional Access policies. Workspace: Admin console → Context-Aware Access"),
+        ("SAAS-10", "Third-Party Apps", "Third-party OAuth app access is reviewed and restricted to an approved allowlist", "General best practice", "M365: Entra ID → Enterprise applications consent review. Workspace: Admin console → API controls → App access control"),
+    ],
+    "F5 BIG-IP Load Balancer (generic - no single CIS benchmark)": [
+        ("LB-1", "Administrative Access", "Management interface (mgmt) is on an isolated out-of-band network; HTTPS only, HTTP redirected/disabled", "F5 hardening guide", "tmsh list sys httpd ssl-port  and confirm mgmt VLAN isolation in the network diagram"),
+        ("LB-2", "Authentication", "Local admin account is not used day-to-day; RADIUS/TACACS+/LDAP with MFA is configured for admin auth", "F5 hardening guide", "tmsh list auth  — review configured auth source and remote-role-group-config"),
+        ("LB-3", "TLS Configuration", "Client SSL profiles enforce TLS 1.2+ with a strong, current cipher string (no SSLv3/TLS 1.0/1.1)", "F5 hardening guide", "tmsh list ltm profile client-ssl <profile> ciphers options"),
+        ("LB-4", "Certificate Management", "Certificates on virtual servers are valid, from a trusted CA, and tracked for expiry", "F5 hardening guide", "tmsh list sys crypto cert  and check expiration dates against a cert-expiry monitoring process"),
+        ("LB-5", "Logging", "Traffic and system logs are forwarded to a central syslog/SIEM via a log-publisher", "F5 hardening guide", "tmsh list sys log-config publisher"),
+        ("LB-6", "High Availability", "HA pair/cluster is configured with a dedicated failover network and config-sync verified", "F5 hardening guide", "tmsh show cm sync-status  and  tmsh show cm failover-status"),
+        ("LB-7", "WAF/Security Modules", "ASM/AWAF (or equivalent WAF) policies are attached to internet-facing virtual servers", "F5 hardening guide", "tmsh list ltm virtual <vs> | grep -i policies  and review attached security policies in the GUI"),
+        ("LB-8", "iRules & Config Hygiene", "Custom iRules are reviewed for security implications and unused/legacy config objects are removed", "General best practice", "tmsh list ltm rule  and review against the current change-management/documentation records"),
+        ("LB-9", "SNMP", "SNMPv3 (authPriv) is used if SNMP monitoring is enabled; SNMPv1/v2c community strings are not in use", "F5 hardening guide", "tmsh list sys snmp"),
+    ],
 }
 
 STATUS_OPTIONS = ["Not Reviewed", "Compliant", "Non-Compliant", "Compensating Control", "Not Applicable"]
@@ -576,8 +839,8 @@ STATUS_COLORS = {
     "Compliant": "#2ecc71",
     "Non-Compliant": "#e74c3c",
     "Compensating Control": "#f39c12",
-    "Not Applicable": "#95a5a6",
-    "Not Reviewed": "#bdc3c7",
+    "Not Applicable": "#94a3b8",
+    "Not Reviewed": "#475569",
 }
 
 # ---------------------------------------------------------------------------
@@ -585,44 +848,79 @@ STATUS_COLORS = {
 # ---------------------------------------------------------------------------
 
 if "responses" not in st.session_state:
-    # key: item_id -> dict(status, notes, reviewer, date)
     st.session_state.responses = {}
-
 if "client_name" not in st.session_state:
     st.session_state.client_name = ""
-
 if "custom_checklists" not in st.session_state:
-    # technologies drafted via the AI "add new technology" feature this session.
-    # key: technology name -> list of (item_id, category, control, reference, audit_step)
     st.session_state.custom_checklists = {}
-
 if "exec_summary" not in st.session_state:
     st.session_state.exec_summary = ""
+if "current_user" not in st.session_state:
+    st.session_state.current_user = TEAM_MEMBERS[0]
+if "library_loaded" not in st.session_state:
+    # Pull any technology the team has permanently added (cloud library),
+    # once per session, and merge it in alongside this session's own drafts.
+    st.session_state.custom_checklists.update(load_checklist_library())
+    st.session_state.library_loaded = True
 
-# Built-in + any AI-drafted technologies, merged for use everywhere below
 ALL_CHECKLISTS = {**CHECKLISTS, **st.session_state.custom_checklists}
 
+
+def _clear_widget_state_for(item_ids):
+    """Remove stale per-item widget keys so freshly loaded data actually
+    renders instead of being shadowed by Streamlit's own widget state."""
+    for item_id in item_ids:
+        for prefix in ("status_", "notes_", "assign_"):
+            st.session_state.pop(f"{prefix}{item_id}", None)
+
+
 # ---------------------------------------------------------------------------
-# 3. SIDEBAR - client & technology setup, import/export
+# 3. SIDEBAR - identity, engagement setup, import/export
 # ---------------------------------------------------------------------------
 
-st.sidebar.title("⚙️ Engagement Setup")
-st.session_state.client_name = st.sidebar.text_input("Client / Engagement name", value=st.session_state.client_name)
-reviewer = st.sidebar.text_input("Reviewer name", value="")
-tech = st.sidebar.selectbox("Technology to assess", list(ALL_CHECKLISTS.keys()))
+st.sidebar.markdown("### 🛡️ Sentinel GRC")
+st.sidebar.caption("Security Configuration & Compliance Platform")
+st.sidebar.markdown("---")
+
+st.sidebar.markdown("**👤 Working as**")
+st.session_state.current_user = st.sidebar.selectbox(
+    "Team member", TEAM_MEMBERS,
+    index=TEAM_MEMBERS.index(st.session_state.current_user) if st.session_state.current_user in TEAM_MEMBERS else 0,
+    label_visibility="collapsed",
+)
+if cloud_persistence_enabled():
+    st.sidebar.caption("☁️ Shared workspace — up to 3 reviewers can work this engagement together in real time via cloud sync.")
+else:
+    st.sidebar.caption("⚠️ Cloud sync not configured — use CSV export/import below to hand work between reviewers.")
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🤖 Add a new technology with AI")
-if not ai_enabled():
-    st.sidebar.caption("Configure a Hugging Face token under [huggingface] in secrets to enable this.")
-else:
-    new_tech_name = st.sidebar.text_input("Technology name", placeholder="e.g. Kong API Gateway", key="new_tech_input")
-    if st.sidebar.button("🤖 Draft checklist with AI", use_container_width=True):
-        if not new_tech_name.strip():
-            st.sidebar.warning("Enter a technology name first.")
-        else:
-            with st.sidebar.status("Drafting checklist...", expanded=False):
-                draft_prompt = f"""You are a senior GRC/OffSec consultant. Draft a hardening/configuration
+st.sidebar.subheader("⚙️ Engagement Setup")
+st.session_state.client_name = st.sidebar.text_input("Client / Engagement name", value=st.session_state.client_name)
+tech = st.sidebar.selectbox("Technology to assess", list(ALL_CHECKLISTS.keys()))
+current_user = st.session_state.current_user
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("➕ Client using something not listed?")
+st.sidebar.caption(
+    "Every engagement eventually hits a technology that isn't pre-built. "
+    "Draft it here — AI-assisted or fully manual — and it's added to the "
+    "platform " + ("permanently, for the whole team." if cloud_persistence_enabled()
+                   else "for the rest of this session (connect Google Sheets in secrets to make additions permanent and shared).")
+)
+
+add_mode = st.sidebar.radio("Method", ["🤖 AI-drafted", "✍️ Manual"], horizontal=True, label_visibility="collapsed")
+
+if add_mode == "🤖 AI-drafted":
+    if not ai_enabled():
+        st.sidebar.caption("Configure a Hugging Face token under [huggingface] in secrets to enable AI drafting — or switch to Manual above.")
+    else:
+        new_tech_name = st.sidebar.text_input("Technology name", placeholder="e.g. Kong API Gateway", key="new_tech_input")
+        if st.sidebar.button("🤖 Draft checklist with AI", use_container_width=True):
+            if not new_tech_name.strip():
+                st.sidebar.warning("Enter a technology name first.")
+            else:
+                with st.sidebar.status("Drafting checklist...", expanded=False):
+                    draft_prompt = f"""You are a senior GRC/OffSec consultant. Draft a hardening/configuration
 checklist for: {new_tech_name}
 
 Return ONLY valid JSON, no markdown fences, no commentary, in this exact shape:
@@ -637,35 +935,70 @@ logging, network/encryption, patching, hardening). If no formal CIS Benchmark
 exists for this technology, set has_cis_benchmark to false and base items on
 the vendor's own security guide or general best practice (NIST/OWASP),
 labeling the reference field accordingly. Be specific and technical."""
-                raw = ask_ai(draft_prompt, system="You output only raw JSON, never prose or markdown fences.")
+                    raw = ask_ai(draft_prompt, system="You output only raw JSON, never prose or markdown fences.")
 
-            if raw.startswith("⚠️"):
-                st.sidebar.error(raw)
+                if raw.startswith("⚠️"):
+                    st.sidebar.error(raw)
+                else:
+                    try:
+                        cleaned = raw.strip()
+                        if cleaned.startswith("```"):
+                            cleaned = cleaned.strip("`")
+                            cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
+                        parsed = json.loads(cleaned)
+                        prefix = "".join(w[0] for w in new_tech_name.upper().split())[:3] or "CU"
+                        items = []
+                        for idx, it in enumerate(parsed.get("items", []), start=1):
+                            items.append((
+                                f"{prefix}-{idx}",
+                                it.get("category", "General"),
+                                it.get("control", ""),
+                                it.get("reference", "AI-drafted, unverified"),
+                                it.get("audit_step", "Manually determine verification method"),
+                            ))
+                        label = f"{new_tech_name} (AI-drafted — review before client use)"
+                        st.session_state.custom_checklists[label] = items
+                        if cloud_persistence_enabled():
+                            save_checklist_to_library(label, items, "AI-drafted", current_user)
+                            st.sidebar.success(f"Drafted {len(items)} controls for {new_tech_name} and saved to the shared library. Select it above.")
+                        else:
+                            st.sidebar.success(f"Drafted {len(items)} controls for {new_tech_name} (this session only — connect Sheets to make it permanent). Select it above.")
+                        st.rerun()
+                    except (json.JSONDecodeError, KeyError, AttributeError) as e:
+                        st.sidebar.error(f"Couldn't parse AI response as a checklist: {e}")
+                        with st.sidebar.expander("Raw AI output"):
+                            st.code(raw)
+else:
+    st.sidebar.caption(
+        "One control per line, pipe-separated: `Category | Control text | Reference | Audit step`. "
+        "Reference and audit step are optional."
+    )
+    man_tech_name = st.sidebar.text_input("Technology name", placeholder="e.g. Kong API Gateway", key="man_tech_input")
+    man_tech_lines = st.sidebar.text_area(
+        "Controls", key="man_tech_lines", height=140,
+        placeholder="Access Control | Admin API requires mTLS client certs | Vendor hardening guide | curl the admin port and confirm TLS is required\nLogging | Access logs shipped to central SIEM | General best practice | Check the log-forwarding plugin config",
+    )
+    if st.sidebar.button("✍️ Add manual checklist", use_container_width=True):
+        if not man_tech_name.strip() or not man_tech_lines.strip():
+            st.sidebar.warning("Enter a technology name and at least one control line.")
+        else:
+            prefix = "".join(w[0] for w in man_tech_name.upper().split())[:3] or "CU"
+            items = []
+            for idx, line in enumerate([l for l in man_tech_lines.split("\n") if l.strip()], start=1):
+                parts = [p.strip() for p in line.split("|")]
+                category = parts[0] if len(parts) > 0 else "General"
+                control = parts[1] if len(parts) > 1 else parts[0]
+                reference = parts[2] if len(parts) > 2 else "Manually added, unverified"
+                audit_step = parts[3] if len(parts) > 3 else "Reviewer to determine verification method"
+                items.append((f"{prefix}-{idx}", category, control, reference, audit_step))
+            label = f"{man_tech_name} (Manually added)"
+            st.session_state.custom_checklists[label] = items
+            if cloud_persistence_enabled():
+                save_checklist_to_library(label, items, "Manual", current_user)
+                st.sidebar.success(f"Added {len(items)} controls for {man_tech_name} and saved to the shared library. Select it above.")
             else:
-                try:
-                    cleaned = raw.strip()
-                    if cleaned.startswith("```"):
-                        cleaned = cleaned.strip("`")
-                        cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
-                    parsed = json.loads(cleaned)
-                    prefix = "".join(w[0] for w in new_tech_name.upper().split())[:3] or "CU"
-                    items = []
-                    for idx, it in enumerate(parsed.get("items", []), start=1):
-                        items.append((
-                            f"{prefix}-{idx}",
-                            it.get("category", "General"),
-                            it.get("control", ""),
-                            it.get("reference", "AI-drafted, unverified"),
-                            it.get("audit_step", "Manually determine verification method"),
-                        ))
-                    label = f"{new_tech_name} (AI-drafted — review before client use)"
-                    st.session_state.custom_checklists[label] = items
-                    st.sidebar.success(f"Drafted {len(items)} controls for {new_tech_name}. Select it above.")
-                    st.rerun()
-                except (json.JSONDecodeError, KeyError, AttributeError) as e:
-                    st.sidebar.error(f"Couldn't parse AI response as a checklist: {e}")
-                    with st.sidebar.expander("Raw AI output"):
-                        st.code(raw)
+                st.sidebar.success(f"Added {len(items)} controls for {man_tech_name} (this session only). Select it above.")
+            st.rerun()
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("💾 Save / Load Progress")
@@ -673,14 +1006,16 @@ st.sidebar.subheader("💾 Save / Load Progress")
 if cloud_persistence_enabled():
     st.sidebar.success("☁️ Cloud persistence connected")
     cc1, cc2 = st.sidebar.columns(2)
-    if cc1.button("☁️ Save to cloud", use_container_width=True):
-        save_to_cloud(st.session_state.client_name, tech, st.session_state.responses)
-        st.sidebar.success("Saved.")
-    if cc2.button("☁️ Load from cloud", use_container_width=True):
+    if cc1.button("☁️ Save", use_container_width=True):
+        save_to_cloud(st.session_state.client_name, tech, st.session_state.responses, current_user)
+        st.sidebar.success("Saved & logged.")
+    if cc2.button("☁️ Load", use_container_width=True):
         loaded = load_from_cloud(st.session_state.client_name, tech)
         if loaded:
+            _clear_widget_state_for(loaded.keys())
             st.session_state.responses.update(loaded)
             st.sidebar.success(f"Loaded {len(loaded)} items.")
+            st.rerun()
         else:
             st.sidebar.warning("No saved data found for this client/technology.")
 else:
@@ -689,11 +1024,8 @@ else:
         "below. See README.md to add Google Sheets persistence."
     )
 
-# Export
 if st.session_state.responses:
-    export_rows = []
-    for item_id, data in st.session_state.responses.items():
-        export_rows.append({"item_id": item_id, **data})
+    export_rows = [{"item_id": item_id, **data} for item_id, data in st.session_state.responses.items()]
     export_df = pd.DataFrame(export_rows)
     csv_buf = io.StringIO()
     export_df.to_csv(csv_buf, index=False)
@@ -702,42 +1034,59 @@ if st.session_state.responses:
         data=csv_buf.getvalue(),
         file_name=f"{(st.session_state.client_name or 'client').replace(' ', '_')}_compliance_progress.csv",
         mime="text/csv",
+        use_container_width=True,
     )
 
 uploaded = st.sidebar.file_uploader("⬆️ Resume from CSV", type=["csv"])
 if uploaded is not None:
     resume_df = pd.read_csv(uploaded)
+    loaded_ids = []
     for _, row in resume_df.iterrows():
-        st.session_state.responses[row["item_id"]] = {
+        item_id = row["item_id"]
+        loaded_ids.append(item_id)
+        st.session_state.responses[item_id] = {
             "status": row.get("status", "Not Reviewed"),
             "notes": row.get("notes", "") if pd.notna(row.get("notes", "")) else "",
-            "reviewer": row.get("reviewer", "") if pd.notna(row.get("reviewer", "")) else "",
-            "date": row.get("date", "") if pd.notna(row.get("date", "")) else "",
             "category": row.get("category", ""),
             "control": row.get("control", ""),
             "reference": row.get("reference", ""),
             "audit_step": row.get("audit_step", "") if pd.notna(row.get("audit_step", "")) else "",
+            "severity": row.get("severity", "") if pd.notna(row.get("severity", "")) else "",
+            "assigned_to": row.get("assigned_to", "") if pd.notna(row.get("assigned_to", "")) else "",
+            "last_updated_by": row.get("last_updated_by", "") if pd.notna(row.get("last_updated_by", "")) else "",
+            "last_updated_at": row.get("last_updated_at", "") if pd.notna(row.get("last_updated_at", "")) else "",
         }
+    _clear_widget_state_for(loaded_ids)
     st.sidebar.success(f"Loaded {len(resume_df)} saved responses.")
+    st.rerun()
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
     "Checklists are built from CIS Benchmark categories where a published "
     "benchmark exists for the technology. Where no formal CIS Benchmark "
-    "applies (e.g. custom web apps), a generic best-practice checklist is "
-    "used instead. Always validate against the current official benchmark "
-    "PDF for the exact build/version in scope before sign-off."
+    "applies, a generic best-practice checklist is used instead. Always "
+    "validate against the current official benchmark PDF for the exact "
+    "build/version in scope before sign-off."
 )
 
 # ---------------------------------------------------------------------------
-# 4. MAIN - Tabs: Checklist / Dashboard
+# 4. MAIN - Header + Tabs
 # ---------------------------------------------------------------------------
 
-st.title("🛡️ Security Configuration & CIS Compliance Tool")
-st.caption(f"Client: **{st.session_state.client_name or '—'}**  |  Technology: **{tech}**")
+st.markdown(f"""
+<div class="hero-banner">
+    <div class="hero-sub">Security Configuration &amp; CIS Compliance Assessment Platform</div>
+    <p class="hero-title">🛡️ Sentinel GRC</p>
+    <div class="hero-meta">
+        <b>Client:</b> {st.session_state.client_name or '—'} &nbsp;·&nbsp;
+        <b>Technology:</b> {tech} &nbsp;·&nbsp;
+        <b>Working as:</b> <span class="badge badge-you">{current_user}</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-tab_checklist, tab_dashboard, tab_engagements = st.tabs(
-    ["📋 Checklist", "📊 Compliance Dashboard", "📁 Engagements"]
+tab_checklist, tab_dashboard, tab_portfolio, tab_engagements = st.tabs(
+    ["📋 Checklist", "📊 Compliance Dashboard", "🧭 Portfolio Overview", "📁 Engagements & Activity"]
 )
 
 items = ALL_CHECKLISTS[tech]
@@ -745,11 +1094,21 @@ categories = sorted(set(c for _, c, _, _, _ in items))
 
 SEVERITY_BADGE = {"Critical": "🔴", "High": "🟠", "Medium": "🟡", "Low": "⚪"}
 
+# ---------------------------------------------------------------------------
+# TAB: Checklist
+# ---------------------------------------------------------------------------
+
 with tab_checklist:
     st.subheader("Configuration Checklist")
-    filter_status = st.multiselect("Filter by status", STATUS_OPTIONS, default=[])
-    filter_severity = st.multiselect("Filter by severity", list(SEVERITY_WEIGHTS.keys()), default=[])
-    search = st.text_input("Search controls", "")
+    fcol1, fcol2, fcol3, fcol4 = st.columns([1.3, 1.3, 1.6, 1])
+    with fcol1:
+        filter_status = st.multiselect("Filter by status", STATUS_OPTIONS, default=[])
+    with fcol2:
+        filter_severity = st.multiselect("Filter by severity", list(SEVERITY_WEIGHTS.keys()), default=[])
+    with fcol3:
+        search = st.text_input("Search controls", "")
+    with fcol4:
+        my_items_only = st.checkbox(f"My items only", help=f"Show only controls assigned to {current_user}")
 
     for cat in categories:
         cat_items = [it for it in items if it[1] == cat]
@@ -772,11 +1131,15 @@ with tab_checklist:
                 if filter_status and current_status not in filter_status:
                     continue
 
+                current_assignee = existing.get("assigned_to", "") or "Unassigned"
+                if my_items_only and current_assignee != current_user:
+                    continue
+
                 col1, col2 = st.columns([3, 1])
                 with col1:
                     st.markdown(f"**{item_id}** — {control}  {SEVERITY_BADGE.get(severity, '')} `{severity}`")
                     st.caption(f"Reference: {ref}")
-                    st.markdown(f"🔍 **Audit step:** {audit_step}")
+                    st.markdown(f'<div class="audit-step">🔍 {audit_step}</div>', unsafe_allow_html=True)
                     fw_line = " · ".join(f"**{k}:** {v}" for k, v in frameworks.items())
                     st.caption(f"Framework mapping: {fw_line}")
                 with col2:
@@ -786,6 +1149,15 @@ with tab_checklist:
                         key=f"status_{item_id}",
                         label_visibility="collapsed",
                     )
+                    assignee_options = ["Unassigned"] + TEAM_MEMBERS
+                    default_assignee = current_assignee if current_assignee in assignee_options else "Unassigned"
+                    assigned_to = st.selectbox(
+                        "Assigned to", assignee_options,
+                        index=assignee_options.index(default_assignee),
+                        key=f"assign_{item_id}",
+                        label_visibility="collapsed",
+                    )
+
                 notes = st.text_area(
                     "Evidence / notes", value=existing.get("notes", ""),
                     key=f"notes_{item_id}", height=60,
@@ -814,6 +1186,10 @@ REASON: <one sentence>"""
                             else:
                                 st.info(f"🤖 AI suggestion (confirm before applying): {suggestion}")
 
+                prior = st.session_state.responses.get(item_id, {})
+                changed = (prior.get("status") != status or prior.get("notes") != notes
+                           or prior.get("assigned_to", "Unassigned") != assigned_to)
+
                 st.session_state.responses[item_id] = {
                     "status": status,
                     "notes": notes,
@@ -823,13 +1199,18 @@ REASON: <one sentence>"""
                     "audit_step": audit_step,
                     "severity": severity,
                     "frameworks": frameworks,
-                    "reviewer": reviewer,
-                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "assigned_to": "" if assigned_to == "Unassigned" else assigned_to,
+                    "last_updated_by": current_user if changed else prior.get("last_updated_by", current_user),
+                    "last_updated_at": datetime.now().strftime("%Y-%m-%d %H:%M") if changed else prior.get("last_updated_at", ""),
                 }
                 st.markdown("---")
 
+# ---------------------------------------------------------------------------
+# TAB: Compliance Dashboard (single technology)
+# ---------------------------------------------------------------------------
+
 with tab_dashboard:
-    st.subheader("Compliance Dashboard")
+    st.subheader(f"Compliance Dashboard — {tech}")
 
     all_ids = [it[0] for it in items]
     item_lookup = {it[0]: it for it in items}
@@ -840,7 +1221,7 @@ with tab_dashboard:
             recorded[i] = r
         else:
             _, cat, ctrl, _, _ = item_lookup[i]
-            recorded[i] = {"status": "Not Reviewed", "category": cat, "severity": classify_control(cat, ctrl)["severity"]}
+            recorded[i] = {"status": "Not Reviewed", "category": cat, "severity": classify_control(cat, ctrl)["severity"], "assigned_to": ""}
 
     df = pd.DataFrame([
         {
@@ -848,6 +1229,7 @@ with tab_dashboard:
             "category": recorded[i].get("category", ""),
             "status": recorded[i].get("status", "Not Reviewed"),
             "severity": recorded[i].get("severity") or classify_control(recorded[i].get("category", ""), "")["severity"],
+            "assigned_to": recorded[i].get("assigned_to", "") or "Unassigned",
         }
         for i in all_ids
     ])
@@ -889,8 +1271,10 @@ with tab_dashboard:
         status_counts.columns = ["status", "count"]
         fig_pie = px.pie(
             status_counts, names="status", values="count",
-            color="status", color_discrete_map=STATUS_COLORS, hole=0.45,
+            color="status", color_discrete_map=STATUS_COLORS, hole=0.55,
         )
+        fig_pie.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                               font_color="#cbd5e1", legend_font_color="#cbd5e1")
         st.plotly_chart(fig_pie, use_container_width=True)
 
     with c2:
@@ -909,8 +1293,18 @@ with tab_dashboard:
             color="compliance_pct", color_continuous_scale=["#e74c3c", "#f39c12", "#2ecc71"],
         )
         fig_bar.update_traces(texttemplate="%{text}%", textposition="outside")
-        fig_bar.update_layout(coloraxis_showscale=False)
+        fig_bar.update_layout(coloraxis_showscale=False, paper_bgcolor="rgba(0,0,0,0)",
+                               plot_bgcolor="rgba(0,0,0,0)", font_color="#cbd5e1")
         st.plotly_chart(fig_bar, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("**👥 Workload by reviewer**")
+    workload = df.groupby("assigned_to").size().reset_index(name="controls")
+    open_by_owner = df[df["status"] == "Non-Compliant"].groupby("assigned_to").size().reset_index(name="open_findings")
+    workload = workload.merge(open_by_owner, on="assigned_to", how="left").fillna(0)
+    workload["open_findings"] = workload["open_findings"].astype(int)
+    st.dataframe(workload.rename(columns={"assigned_to": "Reviewer", "controls": "Controls Assigned", "open_findings": "Open Findings"}),
+                 use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.markdown("**⚠️ Open Non-Compliant Items (remediation tracker)**")
@@ -922,6 +1316,7 @@ with tab_dashboard:
                 "Item": i, "Category": r.get("category"), "Severity": r.get("severity"),
                 "Control": r.get("control"), "Notes": r.get("notes"),
                 "Reference": r.get("reference"), "Audit Step": r.get("audit_step"),
+                "Assigned": r.get("assigned_to") or "Unassigned",
             })
     if open_items:
         open_df = pd.DataFrame(open_items)
@@ -983,7 +1378,8 @@ and a one-line recommended next step. Do not invent findings not listed above.""
             with st.spinner("Thinking..."):
                 context_rows = [
                     {"item_id": i, "category": r.get("category"), "status": r.get("status"),
-                     "severity": r.get("severity"), "control": r.get("control"), "notes": r.get("notes")}
+                     "severity": r.get("severity"), "control": r.get("control"), "notes": r.get("notes"),
+                     "assigned_to": r.get("assigned_to")}
                     for i, r in st.session_state.responses.items()
                 ]
                 qa_prompt = f"""Assessment data for {tech} ({st.session_state.client_name or 'client'}):
@@ -1003,9 +1399,7 @@ Answer using only the data above. If the data doesn't cover the question, say so
     exp_col1, exp_col2 = st.columns(2)
     with exp_col1:
         if st.session_state.responses:
-            full_export = []
-            for item_id, data in st.session_state.responses.items():
-                full_export.append({"item_id": item_id, **data})
+            full_export = [{"item_id": item_id, **data} for item_id, data in st.session_state.responses.items()]
             full_df = pd.DataFrame(full_export)
             csv_buf2 = io.StringIO()
             full_df.to_csv(csv_buf2, index=False)
@@ -1022,7 +1416,7 @@ Answer using only the data above. If the data doesn't cover the question, say so
             docx_bytes = build_docx_report(
                 client_name=st.session_state.client_name or "Client",
                 technology=tech,
-                reviewer_name=reviewer,
+                reviewer_name=current_user,
                 weighted_pct=weighted_compliance_pct,
                 raw_pct=compliance_pct,
                 totals={"total": total, "compliant": int(compliant), "noncompliant": int(noncompliant),
@@ -1039,6 +1433,61 @@ Answer using only the data above. If the data doesn't cover the question, say so
                 use_container_width=True,
             )
 
+# ---------------------------------------------------------------------------
+# TAB: Portfolio Overview (all technologies for this client, cloud-backed)
+# ---------------------------------------------------------------------------
+
+with tab_portfolio:
+    st.subheader(f"Portfolio Overview — {st.session_state.client_name or 'Unnamed Client'}")
+    if not cloud_persistence_enabled():
+        st.info(
+            "Portfolio Overview aggregates every technology assessed for a client into one "
+            "executive view. It requires cloud persistence (Google Sheets) so it can read across "
+            "all saved engagement tabs — configure `[gsheets]` and `[gcp_service_account]` in secrets.toml."
+        )
+    elif not st.session_state.client_name.strip():
+        st.info("Enter a client / engagement name in the sidebar to see their portfolio.")
+    else:
+        rollup = list_client_engagements(st.session_state.client_name)
+        if not rollup:
+            st.info("No saved engagements found for this client yet. Save progress from the sidebar on at least one technology.")
+        else:
+            roll_df = pd.DataFrame(rollup)
+            overall = round((roll_df["weighted_compliance"] * roll_df["controls"]).sum() / roll_df["controls"].sum(), 1)
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Overall Risk-Weighted Compliance", f"{overall}%")
+            p2.metric("Technologies Assessed", len(roll_df))
+            p3.metric("Total Non-Compliant", int(roll_df["non_compliant"].sum()))
+            p4.metric("Critical Findings Open", int(roll_df["critical_open"].sum()))
+
+            fig = px.bar(
+                roll_df, x="weighted_compliance", y="technology", orientation="h",
+                range_x=[0, 100], text="weighted_compliance",
+                color="weighted_compliance", color_continuous_scale=["#e74c3c", "#f39c12", "#2ecc71"],
+                labels={"weighted_compliance": "Risk-Weighted Compliance %", "technology": ""},
+            )
+            fig.update_traces(texttemplate="%{text}%", textposition="outside")
+            fig.update_layout(coloraxis_showscale=False, paper_bgcolor="rgba(0,0,0,0)",
+                               plot_bgcolor="rgba(0,0,0,0)", font_color="#cbd5e1", height=max(320, 55 * len(roll_df)))
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("**Technology detail**")
+            st.dataframe(
+                roll_df.rename(columns={
+                    "technology": "Technology", "controls": "Controls", "weighted_compliance": "Risk-Weighted %",
+                    "non_compliant": "Non-Compliant", "critical_open": "Critical Open", "not_reviewed": "Not Reviewed",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+
+            worst = roll_df.iloc[0]
+            if worst["critical_open"] > 0:
+                st.error(f"🔴 Highest risk: **{worst['technology']}** has {int(worst['critical_open'])} open Critical finding(s) and sits at {worst['weighted_compliance']}% risk-weighted compliance.")
+
+# ---------------------------------------------------------------------------
+# TAB: Engagements & Activity
+# ---------------------------------------------------------------------------
+
 with tab_engagements:
     st.subheader("Engagements")
     if not cloud_persistence_enabled():
@@ -1054,12 +1503,13 @@ with tab_engagements:
             rows = []
             for ws in worksheets:
                 name = ws.title
+                if name == ACTIVITY_TAB:
+                    continue
                 if "__" in name:
                     client_part, tech_part = name.split("__", 1)
                 else:
                     client_part, tech_part = name, ""
                 try:
-                    row_count = max(ws.row_count - 1, 0)
                     records = ws.get_all_records()
                     nc = sum(1 for r in records if r.get("status") == "Non-Compliant")
                 except Exception:
@@ -1070,8 +1520,20 @@ with tab_engagements:
                 })
             if rows:
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-                st.caption("Select a client + technology in the sidebar and click '☁️ Load from cloud' to resume any of these engagements.")
+                st.caption("Select a client + technology in the sidebar and click '☁️ Load' to resume any of these engagements.")
             else:
                 st.info("No engagements saved yet. Save progress from the sidebar to see it listed here.")
         except Exception as e:
             st.error(f"Could not list engagements: {e}")
+
+        st.markdown("---")
+        st.subheader("🕒 Recent Team Activity")
+        st.caption("Every cloud save is logged here with reviewer, client and technology — so all 3 seats can see who touched what.")
+        try:
+            activity = fetch_activity_log(limit=30)
+            if activity:
+                st.dataframe(pd.DataFrame(activity), use_container_width=True, hide_index=True)
+            else:
+                st.info("No activity logged yet. Activity is recorded automatically whenever anyone clicks '☁️ Save'.")
+        except Exception as e:
+            st.error(f"Could not load activity log: {e}")
