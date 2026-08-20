@@ -5,6 +5,498 @@ import plotly.graph_objects as go
 from datetime import datetime
 import io
 import json
+import time
+
+try:
+    from docx import Document
+    from docx.shared import Pt, Inches, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    GSPREAD_AVAILABLE = True
+except ImportError:
+    GSPREAD_AVAILABLE = False
+
+try:
+    from huggingface_hub import InferenceClient
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+
+SHEETS_SCOPE = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+ACTIVITY_TAB = "_activity_log"
+LIBRARY_TAB = "_checklist_library"
+
+# ---------------------------------------------------------------------------
+# HUGGING FACE MODEL DEFAULTS
+#
+# meta-llama/Llama-3.1-8B-Instruct is gated and frequently is NOT deployed
+# on the free serverless Inference API, which is the #1 reason "AI features"
+# silently fail even with a valid token. We default to a model that is
+# reliably servable on the free tier, and let the user override in secrets.
+# We also pass provider="auto" (huggingface_hub >= 0.24) so HF routes the
+# request to whichever inference provider currently hosts the model instead
+# of assuming the legacy single free endpoint.
+# ---------------------------------------------------------------------------
+DEFAULT_HF_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+
+
+def get_team_members():
+    configured = st.secrets.get("team", {}).get("members", None)
+    if configured and len(configured) > 0:
+        return list(configured)
+    return ["Reviewer 1", "Reviewer 2", "Reviewer 3"]
+
+
+# ---------------------------------------------------------------------------
+# GOOGLE SHEETS - shared, multi-user persistence layer
+# ---------------------------------------------------------------------------
+
+@st.cache_resource(show_spinner=False)
+def get_gsheet_client():
+    if not GSPREAD_AVAILABLE:
+        return None
+    if "gcp_service_account" not in st.secrets or "sheet_id" not in st.secrets.get("gsheets", {}):
+        return None
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]), scopes=SHEETS_SCOPE
+    )
+    return gspread.authorize(creds)
+
+
+def cloud_persistence_enabled() -> bool:
+    return get_gsheet_client() is not None
+
+
+def _sheet_tab_name(client_name: str, technology: str) -> str:
+    raw = f"{client_name}__{technology}".strip() or "untitled"
+    safe = "".join(c for c in raw if c.isalnum() or c in ("_", "-", " "))
+    return safe[:95]
+
+
+RESPONSE_COLUMNS = [
+    "item_id", "category", "control", "reference", "audit_step", "status",
+    "severity", "notes", "assigned_to", "last_updated_by", "last_updated_at",
+]
+
+
+def save_to_cloud(client_name: str, technology: str, responses: dict, actor: str) -> None:
+    gc = get_gsheet_client()
+    if gc is None:
+        return
+    sh = gc.open_by_key(st.secrets["gsheets"]["sheet_id"])
+    tab_name = _sheet_tab_name(client_name, technology)
+    try:
+        ws = sh.worksheet(tab_name)
+        ws.clear()
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=tab_name, rows=max(200, len(responses) + 20), cols=len(RESPONSE_COLUMNS) + 2)
+
+    rows = [RESPONSE_COLUMNS]
+    for item_id, data in responses.items():
+        rows.append([item_id] + [str(data.get(col, "") or "") for col in RESPONSE_COLUMNS[1:]])
+    ws.update(rows)
+    log_activity(sh, actor, client_name, technology, f"Saved {len(responses)} control(s) to the shared workspace.")
+
+
+def load_from_cloud(client_name: str, technology: str) -> dict:
+    gc = get_gsheet_client()
+    if gc is None:
+        return {}
+    sh = gc.open_by_key(st.secrets["gsheets"]["sheet_id"])
+    tab_name = _sheet_tab_name(client_name, technology)
+    try:
+        ws = sh.worksheet(tab_name)
+    except gspread.WorksheetNotFound:
+        return {}
+
+    records = ws.get_all_records()
+    loaded = {}
+    for row in records:
+        item_id = row.get("item_id")
+        if not item_id:
+            continue
+        loaded[item_id] = {
+            "status": row.get("status", "Not Reviewed") or "Not Reviewed",
+            "notes": row.get("notes", ""),
+            "category": row.get("category", ""),
+            "control": row.get("control", ""),
+            "reference": row.get("reference", ""),
+            "audit_step": row.get("audit_step", ""),
+            "severity": row.get("severity", ""),
+            "assigned_to": row.get("assigned_to", ""),
+            "last_updated_by": row.get("last_updated_by", ""),
+            "last_updated_at": row.get("last_updated_at", ""),
+        }
+    return loaded
+
+
+def log_activity(sh, actor, client_name, technology, message):
+    try:
+        try:
+            log_ws = sh.worksheet(ACTIVITY_TAB)
+        except gspread.WorksheetNotFound:
+            log_ws = sh.add_worksheet(title=ACTIVITY_TAB, rows=500, cols=5)
+            log_ws.update([["timestamp", "user", "client", "technology", "action"]])
+        log_ws.append_row([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), actor, client_name, technology, message,
+        ])
+    except Exception:
+        pass # activity logging is best-effort and must never block a save
+
+
+def fetch_activity_log(limit=25):
+    gc = get_gsheet_client()
+    if gc is None:
+        return []
+    sh = gc.open_by_key(st.secrets["gsheets"]["sheet_id"])
+    try:
+        log_ws = sh.worksheet(ACTIVITY_TAB)
+    except gspread.WorksheetNotFound:
+        return []
+    records = log_ws.get_all_records()
+    return list(reversed(records))[:limit]
+
+
+def list_client_engagements(client_name: str):
+    gc = get_gsheet_client()
+    if gc is None:
+        return []
+    sh = gc.open_by_key(st.secrets["gsheets"]["sheet_id"])
+    prefix = f"{client_name}__"
+    out = []
+    for ws in sh.worksheets():
+        if ws.title == ACTIVITY_TAB or not ws.title.startswith(prefix):
+            continue
+        technology = ws.title[len(prefix):]
+        try:
+            records = ws.get_all_records()
+        except Exception:
+            continue
+        if not records:
+            continue
+        df = pd.DataFrame(records)
+        df["weight"] = df["severity"].map(SEVERITY_WEIGHTS).fillna(1)
+        applicable = df[df["status"] != "Not Applicable"]
+        good = applicable[applicable["status"].isin(["Compliant", "Compensating Control"])]
+        weighted_pct = round((good["weight"].sum() / applicable["weight"].sum()) * 100, 1) if len(applicable) else 0.0
+        crit_open = int(((df["status"] == "Non-Compliant") & (df["severity"] == "Critical")).sum())
+        out.append({
+            "technology": technology,
+            "controls": len(df),
+            "weighted_compliance": weighted_pct,
+            "non_compliant": int((df["status"] == "Non-Compliant").sum()),
+            "critical_open": crit_open,
+            "not_reviewed": int((df["status"] == "Not Reviewed").sum()),
+        })
+    return sorted(out, key=lambda x: x["weighted_compliance"])
+
+
+# ---------------------------------------------------------------------------
+# CHECKLIST LIBRARY
+# ---------------------------------------------------------------------------
+
+LIBRARY_COLUMNS = ["technology", "item_id", "category", "control", "reference", "audit_step", "source", "added_by", "added_at"]
+
+
+def save_checklist_to_library(technology: str, items: list, source: str, actor: str) -> None:
+    gc = get_gsheet_client()
+    if gc is None:
+        return
+    sh = gc.open_by_key(st.secrets["gsheets"]["sheet_id"])
+    try:
+        ws = sh.worksheet(LIBRARY_TAB)
+        existing = ws.get_all_records()
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=LIBRARY_TAB, rows=1000, cols=len(LIBRARY_COLUMNS) + 2)
+        ws.update([LIBRARY_COLUMNS])
+        existing = []
+
+    keep_rows = [LIBRARY_COLUMNS] + [
+        [r.get(c, "") for c in LIBRARY_COLUMNS] for r in existing if r.get("technology") != technology
+    ]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    new_rows = [
+        [technology, item_id, category, control, reference, audit_step, source, actor, now]
+        for item_id, category, control, reference, audit_step in items
+    ]
+    ws.clear()
+    ws.update(keep_rows + new_rows)
+    log_activity(sh, actor, "—", technology, f"Added '{technology}' to the shared checklist library ({len(items)} controls, {source}).")
+
+
+def load_checklist_library() -> dict:
+    gc = get_gsheet_client()
+    if gc is None:
+        return {}
+    sh = gc.open_by_key(st.secrets["gsheets"]["sheet_id"])
+    try:
+        ws = sh.worksheet(LIBRARY_TAB)
+    except gspread.WorksheetNotFound:
+        return {}
+    records = ws.get_all_records()
+    out = {}
+    for r in records:
+        tech = r.get("technology")
+        if not tech:
+            continue
+        out.setdefault(tech, []).append((
+            r.get("item_id", ""), r.get("category", ""), r.get("control", ""),
+            r.get("reference", ""), r.get("audit_step", ""),
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# HUGGING FACE - AI-assisted drafting, verdicts, summaries, Q&A
+#
+# FIXES vs. original:
+# 1. provider="auto" so huggingface_hub routes to a live inference
+# provider for the chosen model instead of assuming one fixed
+# free endpoint (this is the #1 cause of silent "not connected").
+# 2. Real exception text is surfaced (st.session_state["ai_last_error"])
+# instead of being swallowed into a generic string, so you can
+# actually diagnose a bad token / wrong model / rate limit / etc.
+# 3. test_ai_connection() gives a one-call health check you can show
+# in the sidebar instead of finding out an AI feature is broken
+# only when a reviewer clicks it mid-audit.
+# 4. Default model swapped to one that is reliably servable for chat
+# completion on the free tier; override via
+# [huggingface]
+# api_key = "hf_xxx"
+# model = "your/preferred-model"
+# ---------------------------------------------------------------------------
+
+@st.cache_resource(show_spinner=False)
+def get_hf_client():
+    if not HF_AVAILABLE:
+        return None
+    if "huggingface" not in st.secrets or "api_key" not in st.secrets.get("huggingface", {}):
+        return None
+    model = st.secrets["huggingface"].get("model", DEFAULT_HF_MODEL)
+    token = st.secrets["huggingface"]["api_key"]
+    try:
+        return InferenceClient(model=model, token=token, provider="auto")
+    except TypeError:
+        # Older huggingface_hub versions don't accept `provider`.
+        try:
+            return InferenceClient(model=model, token=token)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def ai_enabled() -> bool:
+    return get_hf_client() is not None
+
+
+def test_ai_connection() -> dict:
+    """One-call health check. Returns {'ok': bool, 'message': str}."""
+    if not HF_AVAILABLE:
+        return {"ok": False, "message": "huggingface_hub is not installed in this environment."}
+    if "huggingface" not in st.secrets or "api_key" not in st.secrets.get("huggingface", {}):
+        return {"ok": False, "message": "No [huggingface] api_key found in Streamlit secrets."}
+    client = get_hf_client()
+    if client is None:
+        return {"ok": False, "message": "Client could not be constructed — check the token and model name."}
+    try:
+        resp = client.chat_completion(
+            messages=[{"role": "user", "content": "Reply with the single word: OK"}],
+            max_tokens=5,
+            temperature=0,
+        )
+        _ = resp.choices[0].message.content
+        model = st.secrets["huggingface"].get("model", DEFAULT_HF_MODEL)
+        return {"ok": True, "message": f"Connected — model '{model}' responded successfully."}
+    except Exception as e:
+        return {"ok": False, "message": f"Model call failed: {e}"}
+
+
+def ask_ai(prompt: str, system: str = "", max_tokens: int = 900) -> str:
+    client = get_hf_client()
+    if client is None:
+        if "huggingface" not in st.secrets:
+            return "⚠️ AI features are not configured. Add [huggingface] api_key under Streamlit secrets."
+        return "⚠️ AI client failed to initialize — check your token/model in secrets and see the sidebar connection test for details."
+
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    try:
+        resp = client.chat_completion(messages=messages, max_tokens=max_tokens, temperature=0.3)
+        return resp.choices[0].message.content
+    except AttributeError:
+        # Some huggingface_hub versions expose chat completion under a
+        # different accessor. Fall back before giving up.
+        try:
+            resp = client.chat.completions.create(messages=messages, max_tokens=max_tokens, temperature=0.3)
+            return resp.choices[0].message.content
+        except Exception as e:
+            st.session_state["ai_last_error"] = str(e)
+            return f"⚠️ AI request failed: {e}"
+    except Exception as e:
+        st.session_state["ai_last_error"] = str(e)
+        return f"⚠️ AI request failed: {e}"
+
+
+# ---------------------------------------------------------------------------
+# AGENTIC AUTO-REVIEW
+#
+# Chains several AI calls into one autonomous pass instead of requiring a
+# reviewer to click a separate "AI assist" button per control:
+#
+# 1. TRIAGE — for each Not Reviewed control, draft a likely status +
+# one-line rationale from the control text and any
+# evidence/notes the reviewer already typed.
+# 2. REMEDIATE — for anything triaged Non-Compliant, draft a remediation
+# step in the same pass.
+# 3. SYNTHESIZE — once every item has been triaged, roll the results up
+# into a short executive summary automatically.
+#
+# Guardrail: this never overwrites a control a human has already set. It
+# only proposes drafts for "Not Reviewed" items, and every draft is written
+# with an "AI Suggested — confirm" status prefix so it's visually distinct
+# and requires a reviewer to accept it before it counts as a real finding.
+# This matters for audit-trail integrity: an AI guess should never look
+# indistinguishable from a reviewer's verified judgment.
+# ---------------------------------------------------------------------------
+
+AGENTIC_STATUS_OPTIONS = ["Compliant", "Non-Compliant", "Compensating Control", "Not Applicable"]
+
+
+def _agentic_triage_prompt(control: str, audit_step: str, reference: str, existing_note: str) -> str:
+    evidence = f"\nReviewer evidence/notes so far: {existing_note}" if existing_note else "\nNo evidence has been recorded yet — base your assessment only on the control text and flag that manual verification is still required."
+    return (
+        f"Control: {control}\n"
+        f"Reference: {reference}\n"
+        f"Audit step: {audit_step}"
+        f"{evidence}\n\n"
+        "Respond ONLY as compact JSON, no markdown fences, no commentary:\n"
+        '{"status": one of ["Compliant","Non-Compliant","Compensating Control","Not Applicable"], '
+        '"rationale": "one sentence", '
+        '"remediation": "one sentence remediation step, empty string if status is Compliant or Not Applicable", '
+        '"confidence": one of ["low","medium","high"]}'
+    )
+
+
+def _parse_agentic_json(raw: str) -> dict:
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+    try:
+        data = json.loads(cleaned)
+        if data.get("status") not in AGENTIC_STATUS_OPTIONS:
+            data["status"] = "Non-Compliant"
+        return data
+    except Exception:
+        return {"status": "Non-Compliant", "rationale": "AI response could not be parsed — manual review required.",
+                 "remediation": "", "confidence": "low"}
+
+
+def run_agentic_autoreview(items: list, responses: dict, actor: str, progress_callback=None) -> dict:
+    """
+    items: list of (item_id, category, control, reference, audit_step)
+    responses: current {item_id: {...}} dict, mutated in place for
+               "Not Reviewed" items only.
+    Returns a dict with counts + a list of item_ids that were triaged,
+    for the synthesis step.
+    """
+    triaged_ids = []
+    total = len(items)
+    for idx, (item_id, category, control, reference, audit_step) in enumerate(items):
+        current = responses.get(item_id, {})
+        if current.get("status", "Not Reviewed") != "Not Reviewed":
+            if progress_callback:
+                progress_callback(idx + 1, total, item_id, skipped=True)
+            continue
+
+        prompt = _agentic_triage_prompt(control, audit_step, reference, current.get("notes", ""))
+        raw = ask_ai(
+            prompt,
+            system="You are a security compliance auditor doing rapid triage. Be conservative — when unsure, prefer Non-Compliant with low confidence over an unfounded Compliant.",
+            max_tokens=250,
+        )
+        parsed = _parse_agentic_json(raw)
+
+        confidence_tag = f" [AI confidence: {parsed.get('confidence', 'low')}]"
+        note_parts = [f"AI-Suggested — confirm: {parsed.get('rationale', '')}{confidence_tag}"]
+        if parsed.get("remediation"):
+            note_parts.append(f"Suggested remediation: {parsed['remediation']}")
+
+        clsf = classify_control(category, control)
+        responses[item_id] = {
+            **current,
+            "status": f"AI Suggested — {parsed.get('status', 'Non-Compliant')}",
+            "notes": " | ".join(note_parts),
+            "category": category,
+            "control": control,
+            "reference": reference,
+            "audit_step": audit_step,
+            "severity": current.get("severity") or clsf["severity"],
+            "last_updated_by": f"{actor} (agentic auto-review)",
+            "last_updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        triaged_ids.append(item_id)
+        if progress_callback:
+            progress_callback(idx + 1, total, item_id, skipped=False)
+
+    return {"triaged_count": len(triaged_ids), "triaged_ids": triaged_ids}
+
+
+def agentic_synthesize_summary(technology: str, client_name: str, responses: dict, triaged_ids: list) -> str:
+    """Final step of the agentic chain: roll up everything just triaged
+    (plus any prior human-reviewed items) into an executive summary."""
+    if not triaged_ids:
+        return "No items required auto-triage — everything was already reviewed by a human."
+
+    lines = []
+    for item_id in triaged_ids:
+        d = responses.get(item_id, {})
+        lines.append(f"- {item_id} ({d.get('severity', '?')}): {d.get('status', '')} — {d.get('control', '')}")
+    triage_block = "\n".join(lines)
+
+    prompt = (
+        f"Client: {client_name}\nTechnology: {technology}\n\n"
+        f"The following controls were just auto-triaged by an AI assistant and are PENDING human confirmation:\n"
+        f"{triage_block}\n\n"
+        "Write a 4-6 sentence executive summary for a security leader. State clearly that these are "
+        "AI-drafted findings pending reviewer sign-off, highlight the most severe items, and note overall "
+        "risk posture. Do not use markdown formatting."
+    )
+    return ask_ai(prompt, system="You write concise, board-ready security executive summaries.", max_tokens=350)
+
+
+# ---------------------------------------------------------------------------
+# CONTROL CLASSIFICATION
+# ---------------------------------------------------------------------------
+
+SEVERITY_WEIGHTS = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
+
+_SEVERITY_RULES = [
+    (4, ["root login", "default password", "empty password", "anonymous", "sa account",
+         "enable secret", "encryption key", "unencr
+
+On Thu, Aug 20, 2026, 2:34 PM Pranjal Ambwani <pramb2003@gmail.com> wrote:
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime
+import io
+import json
 
 try:
     from docx import Document
