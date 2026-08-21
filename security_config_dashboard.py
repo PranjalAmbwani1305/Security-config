@@ -22,10 +22,10 @@ except ImportError:
     GSPREAD_AVAILABLE = False
 
 try:
-    import anthropic
-    ANTHROPIC_AVAILABLE = True
+    from huggingface_hub import InferenceClient
+    HF_AVAILABLE = True
 except ImportError:
-    ANTHROPIC_AVAILABLE = False
+    HF_AVAILABLE = False
 
 SHEETS_SCOPE = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -33,7 +33,7 @@ SHEETS_SCOPE = [
 ]
 ACTIVITY_TAB = "_activity_log"
 LIBRARY_TAB = "_checklist_library"
-DEFAULT_AI_MODEL = "claude-sonnet-5"
+DEFAULT_AI_MODEL = "HuggingFaceH4/zephyr-7b-beta"
 
 # ---------------------------------------------------------------------------
 # TEAM / IDENTITY
@@ -263,26 +263,27 @@ def load_checklist_library() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# AI CONNECTION - Anthropic (Claude), configured via Streamlit secrets:
-#   [anthropic]
-#   api_key = "sk-ant-..."
-#   model   = "claude-sonnet-5"   # optional, defaults to DEFAULT_AI_MODEL
+# AI CONNECTION - Hugging Face free Inference API, configured via Streamlit
+# secrets:
+#   [huggingface]
+#   api_key = "hf_..."                          # free token from huggingface.co/settings/tokens
+#   model   = "HuggingFaceH4/zephyr-7b-beta"     # optional, defaults to DEFAULT_AI_MODEL
 #
-# The previous Hugging Face integration required a separate HF token that
-# was never configured in this app's secrets, so ai_enabled() always
-# returned False and every AI feature silently no-oped. Anthropic is used
-# here instead since it needs only one key and matches the rest of the
-# platform's tooling.
+# This is a hosted free tier: no cost, but requests can queue or be slower
+# than a paid API, and a model can occasionally be unavailable if it's
+# cold-starting on Hugging Face's shared infrastructure. If a request fails,
+# ask_ai() surfaces the error rather than failing silently.
 # ---------------------------------------------------------------------------
 
 @st.cache_resource(show_spinner=False)
 def get_ai_client():
-    if not ANTHROPIC_AVAILABLE:
+    if not HF_AVAILABLE:
         return None
-    if "anthropic" not in st.secrets or "api_key" not in st.secrets.get("anthropic", {}):
+    if "huggingface" not in st.secrets or "api_key" not in st.secrets.get("huggingface", {}):
         return None
+    model = st.secrets["huggingface"].get("model", DEFAULT_AI_MODEL)
     try:
-        return anthropic.Anthropic(api_key=st.secrets["anthropic"]["api_key"])
+        return InferenceClient(model=model, token=st.secrets["huggingface"]["api_key"])
     except Exception:
         return None
 
@@ -294,18 +295,16 @@ def ai_enabled() -> bool:
 def ask_ai(prompt: str, system: str = "", max_tokens: int = 900) -> str:
     client = get_ai_client()
     if client is None:
-        return "⚠️ AI features are not configured. Add an API key under [anthropic] in Streamlit secrets."
-    model = st.secrets.get("anthropic", {}).get("model", DEFAULT_AI_MODEL)
+        return "⚠️ AI features are not configured. Add a free token under [huggingface] in Streamlit secrets."
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
     try:
-        resp = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=system or "You are a precise, audit-focused security assistant.",
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return "".join(block.text for block in resp.content if getattr(block, "type", "") == "text")
+        resp = client.chat_completion(messages=messages, max_tokens=max_tokens, temperature=0.3)
+        return resp.choices[0].message.content
     except Exception as e:
-        return f"⚠️ AI request failed: {e}"
+        return f"⚠️ AI request failed: {e}. The free Hugging Face tier can be slow to cold-start or occasionally unavailable — try again in a moment."
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +327,7 @@ AGENT_SYSTEM_PROMPT = (
 def _call_ai_json(prompt: str, system: str = AGENT_SYSTEM_PROMPT, max_tokens: int = 2000, retries: int = 2):
     """Call the model expecting JSON; self-correct up to `retries` times on parse failure."""
     if not ai_enabled():
-        return None, "AI is not configured. Add an API key under [anthropic] in Streamlit secrets."
+        return None, "AI is not configured. Add a free token under [huggingface] in Streamlit secrets."
 
     last_error = None
     current_prompt = prompt
@@ -822,7 +821,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption(f"☁️ Cloud sync: {'connected' if cloud_persistence_enabled() else 'not configured'}")
-    ai_model_label = st.secrets.get("anthropic", {}).get("model", DEFAULT_AI_MODEL)
+    ai_model_label = st.secrets.get("huggingface", {}).get("model", DEFAULT_AI_MODEL)
     st.caption(f"🤖 AI agent: {'connected (' + ai_model_label + ')' if ai_enabled() else 'not configured'}")
 
 # ---------------------------------------------------------------------------
@@ -909,7 +908,7 @@ with tab_checklist:
 
 with tab_agent:
     if not ai_enabled():
-        st.warning("AI agent isn't configured. Add an API key under `[anthropic]` in Streamlit secrets to enable this tab.")
+        st.warning("AI agent isn't configured. Add a free token under `[huggingface]` in Streamlit secrets to enable this tab (get one free at huggingface.co/settings/tokens).")
     else:
         st.markdown("#### 🤖 Auto-draft a checklist")
         st.caption("Give the agent a technology name and it drafts, classifies, and saves a full checklist in one pass — no further prompting needed.")
