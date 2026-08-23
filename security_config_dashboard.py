@@ -147,11 +147,26 @@ except ImportError:
 DEFAULT_HF_MODEL = "HuggingFaceH4/zephyr-7b-beta"
 
 
+def hf_diagnose() -> str:
+    """Returns None if everything needed for AI features is in place, otherwise
+    a specific human-readable reason. Checked independently of client creation
+    so a bad token doesn't get lumped in with 'not configured' at all."""
+    if not HF_AVAILABLE:
+        return "The `huggingface_hub` package isn't installed. Add `huggingface_hub` to requirements.txt and reboot the app."
+    if "huggingface" not in st.secrets:
+        return "No `[huggingface]` section found in Streamlit secrets."
+    hf_secrets = st.secrets.get("huggingface", {})
+    if "api_key" not in hf_secrets or not str(hf_secrets.get("api_key", "")).strip():
+        return "`[huggingface]` section exists in secrets but `api_key` is missing or empty."
+    token = str(hf_secrets["api_key"]).strip()
+    if not token.startswith("hf_"):
+        return "The configured api_key doesn't look like a Hugging Face token (should start with 'hf_')."
+    return None
+
+
 @st.cache_resource(show_spinner=False)
 def get_hf_client():
-    if not HF_AVAILABLE:
-        return None
-    if "huggingface" not in st.secrets or "api_key" not in st.secrets.get("huggingface", {}):
+    if hf_diagnose() is not None:
         return None
     model = st.secrets["huggingface"].get("model", DEFAULT_HF_MODEL)
     try:
@@ -170,7 +185,8 @@ def ask_ai(prompt: str, system: str = "", max_tokens: int = 900) -> str:
     should check for that prefix before treating the result as trustworthy."""
     client = get_hf_client()
     if client is None:
-        return "⚠️ AI features are not configured. Add a Hugging Face token under [huggingface] in Streamlit secrets."
+        reason = hf_diagnose() or "the client failed to initialize for an unknown reason"
+        return f"⚠️ AI features are not available: {reason}"
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -797,12 +813,15 @@ ALL_CHECKLISTS = {**CHECKLISTS, **st.session_state.custom_checklists}
 st.sidebar.markdown("### 🛡️ Sentinel GRC")
 st.sidebar.markdown(f'<div class="library-badge">📚 {len(ALL_CHECKLISTS)} technologies in library</div>', unsafe_allow_html=True)
 cloud_dot = "dot-on" if cloud_persistence_enabled() else "dot-off"
-ai_dot = "dot-on" if ai_enabled() else "dot-off"
+ai_reason = hf_diagnose()
+ai_dot = "dot-off" if ai_reason else "dot-on"
 st.sidebar.markdown(
     f'<div class="library-badge"><span class="status-dot {cloud_dot}"></span>Cloud sync</div>'
     f'<div class="library-badge"><span class="status-dot {ai_dot}"></span>AI agent</div>',
     unsafe_allow_html=True,
 )
+if ai_reason:
+    st.sidebar.caption(f"⚠️ AI agent off: {ai_reason}")
 st.sidebar.title("⚙️ Engagement Setup")
 st.session_state.client_name = st.sidebar.text_input("Client / Engagement name", value=st.session_state.client_name)
 reviewer = st.sidebar.text_input("Reviewer name", value="")
@@ -811,7 +830,7 @@ tech = st.sidebar.selectbox("Technology to assess", list(ALL_CHECKLISTS.keys()))
 st.sidebar.markdown("---")
 st.sidebar.subheader("🤖 Add a new technology with AI")
 if not ai_enabled():
-    st.sidebar.caption("Configure a Hugging Face token under [huggingface] in secrets to enable this.")
+    st.sidebar.caption(f"⚠️ {hf_diagnose()}")
 else:
     new_tech_name = st.sidebar.text_input("Technology name", placeholder="e.g. Kong API Gateway", key="new_tech_input")
     if st.sidebar.button("🤖 Draft checklist with AI", use_container_width=True):
@@ -1169,7 +1188,7 @@ with tab_dashboard:
     st.markdown("---")
     st.markdown("**🤖 AI-assisted reporting**")
     if not ai_enabled():
-        st.caption("Configure a Hugging Face token under [huggingface] in secrets to enable executive summary generation and natural-language Q&A.")
+        st.caption(f"⚠️ {hf_diagnose()}")
     else:
         ai_col1, ai_col2 = st.columns(2)
         with ai_col1:
