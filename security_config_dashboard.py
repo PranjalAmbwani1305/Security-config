@@ -150,17 +150,20 @@ try:
 except ImportError:
     HF_AVAILABLE = False
 
-# Known-good as of the current Inference Providers docs/examples. If this
-# stops working, check https://huggingface.co/models?inference_provider=all&pipeline_tag=text-generation
-# for models that are currently routed by a live provider before swapping it.
-DEFAULT_HF_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+# Verified LIVE against https://huggingface.co/models?inference_provider=all&pipeline_tag=text-generation
+# at the time this was last checked. Provider coverage rotates over time
+# (models get dropped with no warning, which is what caused this whole
+# fallback chain to go stale twice already) - if this stops working, don't
+# guess a replacement, re-check that URL for a model that is CURRENTLY
+# filtered as having an inference provider before swapping it in.
+DEFAULT_HF_MODEL = "openai/gpt-oss-120b"
 
-# A short list of alternates known (at time of writing) to be served by at
-# least one Inference Provider, used only to populate the error message below.
+# Alternates confirmed live on the same check, used only to populate the
+# error message below.
 _FALLBACK_MODEL_SUGGESTIONS = [
-    "meta-llama/Llama-3.3-70B-Instruct",
-    "deepseek-ai/DeepSeek-V3-0324",
     "openai/gpt-oss-120b",
+    "meta-llama/Llama-3.1-8B-Instruct",
+    "deepseek-ai/DeepSeek-R1",
 ]
 
 
