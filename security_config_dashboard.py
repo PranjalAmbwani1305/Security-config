@@ -144,7 +144,7 @@ try:
 except ImportError:
     HF_AVAILABLE = False
 
-DEFAULT_HF_MODEL = "HuggingFaceH4/zephyr-7b-beta"
+DEFAULT_HF_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 
 
 def hf_diagnose() -> str:
@@ -170,7 +170,7 @@ def get_hf_client():
         return None
     model = st.secrets["huggingface"].get("model", DEFAULT_HF_MODEL)
     try:
-        return InferenceClient(model=model, token=st.secrets["huggingface"]["api_key"])
+        return InferenceClient(model=model, token=st.secrets["huggingface"]["api_key"], provider="auto")
     except Exception:
         return None
 
@@ -195,7 +195,66 @@ def ask_ai(prompt: str, system: str = "", max_tokens: int = 900) -> str:
         resp = client.chat_completion(messages=messages, max_tokens=max_tokens, temperature=0.3)
         return resp.choices[0].message.content
     except Exception as e:
+        err_text = str(e)
+        if "not supported by any provider" in err_text or "model_not_supported" in err_text:
+            configured_model = st.secrets.get("huggingface", {}).get("model", DEFAULT_HF_MODEL)
+            return (
+                f"⚠️ The model '{configured_model}' is no longer served by any Hugging Face "
+                f"Inference Provider. Try setting model = \"Qwen/Qwen2.5-7B-Instruct\" or "
+                f"\"meta-llama/Llama-3.1-8B-Instruct\" under [huggingface] in secrets, or check "
+                f"https://huggingface.co/models?inference_provider=all for currently-served models."
+            )
         return f"⚠️ AI request failed: {e}"
+
+
+# ---------------------------------------------------------------------------
+# AGENTIC LAYER
+# This is what actually makes checklist drafting "agentic" rather than a
+# single chatbot call: the agent validates its own output, and on failure
+# feeds its own error back to itself and retries — without asking the human
+# to fix anything — before finally handing back a result (or an honest
+# failure after exhausting its attempts). ask_ai() alone has none of this;
+# it is one request, one response, no self-checking.
+# ---------------------------------------------------------------------------
+
+def agentic_json_call(prompt: str, system: str, max_tokens: int = 1600, max_attempts: int = 3):
+    """
+    Calls the model expecting a JSON object/array back. If the response
+    doesn't parse, the agent appends its own parse error to the prompt and
+    retries automatically, up to max_attempts total. Returns
+    (parsed_json_or_None, attempts_used, last_raw_response).
+    """
+    current_prompt = prompt
+    last_raw = ""
+    for attempt in range(1, max_attempts + 1):
+        raw = ask_ai(current_prompt, system=system, max_tokens=max_tokens)
+        last_raw = raw
+        if raw.startswith("⚠️"):
+            return None, attempt, raw  # infrastructure failure, not a JSON failure — don't retry
+
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
+            if cleaned.rstrip().endswith("json"):
+                cleaned = cleaned.rstrip()[:-4]
+
+        try:
+            parsed = json.loads(cleaned)
+            return parsed, attempt, raw
+        except json.JSONDecodeError as e:
+            if attempt == max_attempts:
+                return None, attempt, raw
+            # Self-correction step: the agent sees its own mistake and retries.
+            current_prompt = (
+                f"{prompt}\n\n"
+                f"Your previous response could not be parsed as JSON. "
+                f"Parser error: {e}\n"
+                f"Your previous response was:\n{raw[:800]}\n\n"
+                f"Return ONLY valid JSON this time — no markdown fences, no commentary, "
+                f"no text before or after the JSON."
+            )
+    return None, max_attempts, last_raw
 
 
 st.set_page_config(page_title="Sentinel GRC | Security Configuration & Compliance Platform", layout="wide", page_icon="🛡️")
@@ -837,7 +896,7 @@ else:
         if not new_tech_name.strip():
             st.sidebar.warning("Enter a technology name first.")
         else:
-            with st.sidebar.status("Drafting checklist...", expanded=False):
+            with st.sidebar.status("Agent is drafting and self-checking...", expanded=False):
                 draft_prompt = f"""You are a senior GRC/OffSec consultant. Draft a hardening/configuration
 checklist for: {new_tech_name}
 
@@ -853,17 +912,20 @@ logging, network/encryption, patching, hardening). If no formal CIS Benchmark
 exists for this technology, set has_cis_benchmark to false and base items on
 the vendor's own security guide or general best practice (NIST/OWASP),
 labeling the reference field accordingly. Be specific and technical."""
-                raw = ask_ai(draft_prompt, system="You output only raw JSON, never prose or markdown fences.")
+                parsed, attempts_used, raw = agentic_json_call(
+                    draft_prompt,
+                    system="You output only raw JSON, never prose or markdown fences.",
+                )
 
-            if raw.startswith("⚠️"):
-                st.sidebar.error(raw)
+            if parsed is None:
+                if raw.startswith("⚠️"):
+                    st.sidebar.error(raw)
+                else:
+                    st.sidebar.error(f"Agent gave up after {attempts_used} self-correction attempts — still not valid JSON.")
+                    with st.sidebar.expander("Last raw output"):
+                        st.code(raw)
             else:
                 try:
-                    cleaned = raw.strip()
-                    if cleaned.startswith("```"):
-                        cleaned = cleaned.strip("`")
-                        cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
-                    parsed = json.loads(cleaned)
                     prefix = "".join(w[0] for w in new_tech_name.upper().split())[:3] or "CU"
                     items = []
                     for idx, it in enumerate(parsed.get("items", []), start=1):
@@ -876,10 +938,11 @@ labeling the reference field accordingly. Be specific and technical."""
                         ))
                     label = f"{new_tech_name} (AI-drafted — review before client use)"
                     st.session_state.custom_checklists[label] = items
-                    st.sidebar.success(f"Drafted {len(items)} controls for {new_tech_name}. Select it above.")
+                    attempt_note = " on the first try" if attempts_used == 1 else f" after {attempts_used} self-correction attempts"
+                    st.sidebar.success(f"Agent drafted {len(items)} controls for {new_tech_name}{attempt_note}. Select it above.")
                     st.rerun()
-                except (json.JSONDecodeError, KeyError, AttributeError) as e:
-                    st.sidebar.error(f"Couldn't parse AI response as a checklist: {e}")
+                except (KeyError, AttributeError) as e:
+                    st.sidebar.error(f"Parsed JSON didn't match the expected checklist shape: {e}")
                     with st.sidebar.expander("Raw AI output"):
                         st.code(raw)
 
