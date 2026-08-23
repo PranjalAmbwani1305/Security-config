@@ -131,11 +131,17 @@ def load_from_cloud(client_name: str, technology: str) -> dict:
 
 # ---------------------------------------------------------------------------
 # HUGGING FACE - AI-assisted features
-# Uses huggingface_hub.InferenceClient against a chat-capable instruct model.
+# Uses huggingface_hub.InferenceClient against a chat-capable instruct model
+# routed through HF's Inference Providers (Together AI, SambaNova, Cerebras,
+# Groq, Novita, etc). NOTE: HF's free serverless API for small models
+# (e.g. Qwen2.5-7B-Instruct, Llama-3.1-8B-Instruct) has largely been
+# deprecated in favor of Inference Providers, which only host a curated set
+# of models per partner. Pick a default that is actually still routed by at
+# least one provider - see https://huggingface.co/models?inference_provider=all
 # Configure via Streamlit secrets:
 #   [huggingface]
 #   api_key = "hf_xxx"
-#   model = "meta-llama/Llama-3.1-8B-Instruct"   # optional, has a default
+#   model = "meta-llama/Llama-3.3-70B-Instruct"   # optional, has a default
 # ---------------------------------------------------------------------------
 
 try:
@@ -144,7 +150,18 @@ try:
 except ImportError:
     HF_AVAILABLE = False
 
-DEFAULT_HF_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+# Known-good as of the current Inference Providers docs/examples. If this
+# stops working, check https://huggingface.co/models?inference_provider=all&pipeline_tag=text-generation
+# for models that are currently routed by a live provider before swapping it.
+DEFAULT_HF_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+
+# A short list of alternates known (at time of writing) to be served by at
+# least one Inference Provider, used only to populate the error message below.
+_FALLBACK_MODEL_SUGGESTIONS = [
+    "meta-llama/Llama-3.3-70B-Instruct",
+    "deepseek-ai/DeepSeek-V3-0324",
+    "openai/gpt-oss-120b",
+]
 
 
 def hf_diagnose() -> str:
@@ -198,11 +215,18 @@ def ask_ai(prompt: str, system: str = "", max_tokens: int = 900) -> str:
         err_text = str(e)
         if "not supported by any provider" in err_text or "model_not_supported" in err_text:
             configured_model = st.secrets.get("huggingface", {}).get("model", DEFAULT_HF_MODEL)
+            # Don't recommend the same dead model back to the user - only
+            # suggest alternates that differ from whatever just failed.
+            alternates = [m for m in _FALLBACK_MODEL_SUGGESTIONS if m != configured_model]
+            if not alternates:
+                alternates = _FALLBACK_MODEL_SUGGESTIONS
+            suggestion_list = ", ".join(f'"{m}"' for m in alternates)
             return (
                 f"⚠️ The model '{configured_model}' is no longer served by any Hugging Face "
-                f"Inference Provider. Try setting model = \"Qwen/Qwen2.5-7B-Instruct\" or "
-                f"\"meta-llama/Llama-3.1-8B-Instruct\" under [huggingface] in secrets, or check "
-                f"https://huggingface.co/models?inference_provider=all for currently-served models."
+                f"Inference Provider. Try setting model to one of: {suggestion_list} "
+                f"under [huggingface] in secrets, or check "
+                f"https://huggingface.co/models?inference_provider=all&pipeline_tag=text-generation "
+                f"for currently-served models."
             )
         return f"⚠️ AI request failed: {e}"
 
@@ -550,7 +574,7 @@ CHECKLISTS = {
         ("L-14", "Access, Authentication & Authorization", "Password complexity, history, and lockout policy enforced via pam_pwquality/faillock", "CIS 5.3.x", "cat /etc/security/pwquality.conf /etc/security/faillock.conf"),
         ("L-15", "Access, Authentication & Authorization", "SSH root login disabled, protocol 2 only, strong ciphers/MACs only", "CIS 5.2.x", "sshd -T | grep -Ei 'permitrootlogin|protocol|ciphers|macs'"),
         ("L-16", "Access, Authentication & Authorization", "sudo requires password and logs all sudo activity", "CIS 5.4.x", "cat /etc/sudoers /etc/sudoers.d/*  and  grep sudo /var/log/secure  (RHEL) or /var/log/auth.log (Debian)"),
-        ("L-17", "Access, Authentication & Authorization", "Empty passwords, unused/system accounts are locked or removed", "CIS 5.5.x", "awk -F: '($2 == '') {print $1}' /etc/shadow  and  passwd -Sa"),
+        ("L-17", "Access, Authentication & Authorization", "Empty passwords, unused/system accounts are locked or removed", "CIS 5.5.x", "awk -F: '($2 == \"\") {print $1}' /etc/shadow  and  passwd -Sa"),
         ("L-18", "System Maintenance", "World-writable files and unowned files/directories are found and remediated", "CIS 6.1.x", "find / -xdev -type f -perm -0002 2>/dev/null"),
         ("L-19", "System Maintenance", "Permissions on /etc/passwd, /etc/shadow, /etc/gshadow are correctly restricted", "CIS 6.1.x", "stat -c '%a %U:%G %n' /etc/passwd /etc/shadow /etc/gshadow"),
         ("L-20", "System Maintenance", "OS and package patching cadence is documented and current", "CIS 1.9 / general", "yum history  (RHEL) or apt list --upgradable  (Debian), cross-checked against the patch management ticket/SOP"),
