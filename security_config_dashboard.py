@@ -144,7 +144,7 @@ try:
 except ImportError:
     HF_AVAILABLE = False
 
-DEFAULT_HF_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_HF_MODEL = "HuggingFaceH4/zephyr-7b-beta"
 
 
 @st.cache_resource(show_spinner=False)
@@ -228,6 +228,78 @@ div[data-testid="stExpander"] {
     background: #0f172a; border: 1px solid #1e293b !important; border-radius: 10px;
 }
 hr { border-color: #1e293b; }
+
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid #1e293b; }
+.stTabs [data-baseweb="tab"] {
+    background: transparent; color: #94a3b8; border-radius: 8px 8px 0 0;
+    padding: 8px 16px; font-weight: 600; font-size: 14px;
+}
+.stTabs [aria-selected="true"] { color: #7dd3fc !important; background: #111827 !important; }
+
+/* Buttons */
+.stButton > button, .stDownloadButton > button {
+    background: #1e293b; color: #e2e8f0; border: 1px solid #334155;
+    border-radius: 8px; font-weight: 600; transition: all 0.15s ease;
+}
+.stButton > button:hover, .stDownloadButton > button:hover {
+    border-color: #38bdf8; color: #7dd3fc; background: #1e293b;
+}
+.stButton > button[kind="primary"] {
+    background: linear-gradient(120deg, #0369a1, #0284c7); border: none; color: #f0f9ff;
+}
+
+/* Text / select / multiselect inputs */
+.stTextInput input, .stTextArea textarea, .stNumberInput input {
+    background: #111827 !important; color: #e2e8f0 !important; border: 1px solid #1f2937 !important; border-radius: 8px !important;
+}
+.stSelectbox div[data-baseweb="select"] > div, .stMultiSelect div[data-baseweb="select"] > div {
+    background: #111827 !important; border: 1px solid #1f2937 !important; border-radius: 8px !important; color: #e2e8f0 !important;
+}
+[data-baseweb="tag"] { background: #0369a1 !important; }
+
+/* Dataframes */
+[data-testid="stDataFrame"] { border: 1px solid #1e293b; border-radius: 10px; overflow: hidden; }
+
+/* File uploader */
+[data-testid="stFileUploaderDropzone"] { background: #111827; border: 1px dashed #334155; border-radius: 10px; }
+
+/* Sidebar headers */
+section[data-testid="stSidebar"] h1, section[data-testid="stSidebar"] h2, section[data-testid="stSidebar"] h3 {
+    color: #f1f5f9 !important;
+}
+
+/* Status pill badges used in the checklist */
+.status-pill {
+    display: inline-block; padding: 3px 11px; border-radius: 999px;
+    font-size: 11.5px; font-weight: 700; letter-spacing: 0.02em; text-transform: uppercase;
+}
+.sev-critical { background: rgba(239,68,68,0.15); color: #fca5a5; border: 1px solid rgba(239,68,68,0.4); }
+.sev-high { background: rgba(249,115,22,0.15); color: #fdba74; border: 1px solid rgba(249,115,22,0.4); }
+.sev-medium { background: rgba(234,179,8,0.15); color: #fde047; border: 1px solid rgba(234,179,8,0.4); }
+.sev-low { background: rgba(148,163,184,0.15); color: #cbd5e1; border: 1px solid rgba(148,163,184,0.4); }
+
+.control-card {
+    background: #0d1424; border: 1px solid #1e293b; border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 10px;
+}
+.control-id { color: #38bdf8; font-weight: 700; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 12.5px; }
+.control-ref { color: #64748b; font-size: 12px; }
+.control-step {
+    background: #0b1120; border: 1px solid #1e293b; border-radius: 6px;
+    padding: 8px 11px; font-family: 'SFMono-Regular', Consolas, monospace;
+    font-size: 12px; color: #a5b4fc; margin: 6px 0;
+}
+.fw-line { color: #64748b; font-size: 11.5px; }
+
+.library-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: #111827; border: 1px solid #1f2937; border-radius: 999px;
+    padding: 4px 12px; font-size: 12px; color: #94a3b8; margin-bottom: 4px;
+}
+.status-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+.dot-on { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+.dot-off { background: #475569; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -723,7 +795,14 @@ ALL_CHECKLISTS = {**CHECKLISTS, **st.session_state.custom_checklists}
 # ---------------------------------------------------------------------------
 
 st.sidebar.markdown("### 🛡️ Sentinel GRC")
-st.sidebar.caption(f"📚 {len(ALL_CHECKLISTS)} technologies in library")
+st.sidebar.markdown(f'<div class="library-badge">📚 {len(ALL_CHECKLISTS)} technologies in library</div>', unsafe_allow_html=True)
+cloud_dot = "dot-on" if cloud_persistence_enabled() else "dot-off"
+ai_dot = "dot-on" if ai_enabled() else "dot-off"
+st.sidebar.markdown(
+    f'<div class="library-badge"><span class="status-dot {cloud_dot}"></span>Cloud sync</div>'
+    f'<div class="library-badge"><span class="status-dot {ai_dot}"></span>AI agent</div>',
+    unsafe_allow_html=True,
+)
 st.sidebar.title("⚙️ Engagement Setup")
 st.session_state.client_name = st.sidebar.text_input("Client / Engagement name", value=st.session_state.client_name)
 reviewer = st.sidebar.text_input("Reviewer name", value="")
@@ -871,7 +950,7 @@ tab_checklist, tab_dashboard, tab_engagements = st.tabs(
 items = ALL_CHECKLISTS[tech]
 categories = sorted(set(c for _, c, _, _, _ in items))
 
-SEVERITY_BADGE = {"Critical": "🔴", "High": "🟠", "Medium": "🟡", "Low": "⚪"}
+SEVERITY_PILL_CLASS = {"Critical": "sev-critical", "High": "sev-high", "Medium": "sev-medium", "Low": "sev-low"}
 
 with tab_checklist:
     st.subheader("Configuration Checklist")
@@ -902,11 +981,17 @@ with tab_checklist:
 
                 col1, col2 = st.columns([3, 1])
                 with col1:
-                    st.markdown(f"**{item_id}** — {control}  {SEVERITY_BADGE.get(severity, '')} `{severity}`")
-                    st.caption(f"Reference: {ref}")
-                    st.markdown(f"🔍 **Audit step:** {audit_step}")
-                    fw_line = " · ".join(f"**{k}:** {v}" for k, v in frameworks.items())
-                    st.caption(f"Framework mapping: {fw_line}")
+                    pill_class = SEVERITY_PILL_CLASS.get(severity, "sev-low")
+                    fw_line = " · ".join(f"<b>{k}:</b> {v}" for k, v in frameworks.items())
+                    st.markdown(f"""
+<div class="control-card">
+    <span class="control-id">{item_id}</span> &nbsp;<span class="status-pill {pill_class}">{severity}</span>
+    <div style="margin-top:6px; color:#e2e8f0; font-size:14.5px;">{control}</div>
+    <div class="control-ref">Reference: {ref}</div>
+    <div class="control-step">🔍 {audit_step}</div>
+    <div class="fw-line">{fw_line}</div>
+</div>
+""", unsafe_allow_html=True)
                 with col2:
                     status = st.selectbox(
                         "Status", STATUS_OPTIONS,
@@ -1019,6 +1104,11 @@ with tab_dashboard:
             status_counts, names="status", values="count",
             color="status", color_discrete_map=STATUS_COLORS, hole=0.45,
         )
+        fig_pie.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#cbd5e1", legend_font_color="#cbd5e1",
+            margin=dict(t=10, b=10, l=10, r=10),
+        )
         st.plotly_chart(fig_pie, use_container_width=True)
 
     with c2:
@@ -1037,7 +1127,13 @@ with tab_dashboard:
             color="compliance_pct", color_continuous_scale=["#e74c3c", "#f39c12", "#2ecc71"],
         )
         fig_bar.update_traces(texttemplate="%{text}%", textposition="outside")
-        fig_bar.update_layout(coloraxis_showscale=False)
+        fig_bar.update_layout(
+            coloraxis_showscale=False,
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#cbd5e1",
+            xaxis=dict(gridcolor="#1e293b"), yaxis=dict(gridcolor="#1e293b"),
+            margin=dict(t=10, b=10, l=10, r=10),
+        )
         st.plotly_chart(fig_bar, use_container_width=True)
 
     st.markdown("---")
@@ -1190,14 +1286,48 @@ with tab_engagements:
                     row_count = max(ws.row_count - 1, 0)
                     records = ws.get_all_records()
                     nc = sum(1 for r in records if r.get("status") == "Non-Compliant")
+                    good = sum(1 for r in records if r.get("status") in ("Compliant", "Compensating Control"))
+                    applicable = sum(1 for r in records if r.get("status") != "Not Applicable")
+                    pct = round((good / applicable) * 100, 1) if applicable else None
                 except Exception:
-                    records, nc = [], 0
+                    records, nc, pct = [], 0, None
                 rows.append({
                     "Client": client_part, "Technology": tech_part,
                     "Controls Recorded": len(records), "Open Non-Compliant": nc,
+                    "Compliance %": pct,
                 })
+
             if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                portfolio_df = pd.DataFrame(rows)
+                scored = portfolio_df[portfolio_df["Compliance %"].notna()]
+
+                p1, p2, p3 = st.columns(3)
+                p1.metric("Active Engagements", len(portfolio_df))
+                p2.metric("Total Open Non-Compliant", int(portfolio_df["Open Non-Compliant"].sum()))
+                p3.metric("Portfolio Avg. Compliance", f"{round(scored['Compliance %'].mean(), 1)}%" if len(scored) else "—")
+
+                if len(scored):
+                    st.markdown("**Compliance by engagement**")
+                    chart_df = scored.copy()
+                    chart_df["Engagement"] = chart_df["Client"] + " — " + chart_df["Technology"]
+                    chart_df = chart_df.sort_values("Compliance %")
+                    fig_portfolio = px.bar(
+                        chart_df, x="Compliance %", y="Engagement", orientation="h",
+                        range_x=[0, 100], text="Compliance %",
+                        color="Compliance %", color_continuous_scale=["#e74c3c", "#f39c12", "#2ecc71"],
+                    )
+                    fig_portfolio.update_traces(texttemplate="%{text}%", textposition="outside")
+                    fig_portfolio.update_layout(
+                        coloraxis_showscale=False,
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                        font_color="#cbd5e1",
+                        xaxis=dict(gridcolor="#1e293b"), yaxis=dict(gridcolor="#1e293b"),
+                        margin=dict(t=10, b=10, l=10, r=10),
+                    )
+                    st.plotly_chart(fig_portfolio, use_container_width=True)
+
+                st.markdown("**All engagements**")
+                st.dataframe(portfolio_df, use_container_width=True, hide_index=True)
                 st.caption("Select a client + technology in the sidebar and click '☁️ Load from cloud' to resume any of these engagements.")
             else:
                 st.info("No engagements saved yet. Save progress from the sidebar to see it listed here.")
