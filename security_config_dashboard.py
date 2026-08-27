@@ -1,24 +1,5 @@
-"""
-Security Configuration & CIS Benchmark Compliance Tool
---------------------------------------------------------
-A Streamlit app that lets a consultant/auditor walk a client through a
-hardening checklist for a chosen technology (based on CIS Benchmark
-categories and general security best practice where a formal CIS
-benchmark doesn't apply), record compliance status + evidence/notes per
-item, and view a live compliance dashboard.
-
-Run with:
-    pip install streamlit pandas plotly gspread google-auth
-    streamlit run security_config_dashboard.py
-
-Cloud persistence (optional):
-    Set up a Google Sheet + service account and add its credentials to
-    Streamlit secrets (see README.md -> "Cloud persistence setup") to get
-    automatic save/load per client that survives app restarts on Streamlit
-    Community Cloud. Without secrets configured, the app still works fully
-    using the CSV export/import already built in.
-"""
-
+import html
+from typing import Optional
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -28,7 +9,6 @@ import json
 
 try:
     from docx import Document
-    from docx.shared import Pt, Inches, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     DOCX_AVAILABLE = True
 except ImportError:
@@ -167,7 +147,7 @@ _FALLBACK_MODEL_SUGGESTIONS = [
 ]
 
 
-def hf_diagnose() -> str:
+def hf_diagnose() -> Optional[str]:
     """Returns None if everything needed for AI features is in place, otherwise
     a specific human-readable reason. Checked independently of client creation
     so a bad token doesn't get lumped in with 'not configured' at all."""
@@ -1010,21 +990,52 @@ if st.session_state.responses:
         mime="text/csv",
     )
 
+def _clean_str(value, default: str = "") -> str:
+    """Coerce a CSV/sheet cell to a plain string, treating NaN/None as default."""
+    return str(value) if pd.notna(value) else default
+
+
 uploaded = st.sidebar.file_uploader("⬆️ Resume from CSV", type=["csv"])
 if uploaded is not None:
-    resume_df = pd.read_csv(uploaded)
-    for _, row in resume_df.iterrows():
-        st.session_state.responses[row["item_id"]] = {
-            "status": row.get("status", "Not Reviewed"),
-            "notes": row.get("notes", "") if pd.notna(row.get("notes", "")) else "",
-            "reviewer": row.get("reviewer", "") if pd.notna(row.get("reviewer", "")) else "",
-            "date": row.get("date", "") if pd.notna(row.get("date", "")) else "",
-            "category": row.get("category", ""),
-            "control": row.get("control", ""),
-            "reference": row.get("reference", ""),
-            "audit_step": row.get("audit_step", "") if pd.notna(row.get("audit_step", "")) else "",
-        }
-    st.sidebar.success(f"Loaded {len(resume_df)} saved responses.")
+    try:
+        resume_df = pd.read_csv(uploaded)
+    except Exception as e:
+        st.sidebar.error(f"Could not read that CSV: {e}")
+        resume_df = pd.DataFrame()
+
+    if not resume_df.empty and "item_id" not in resume_df.columns:
+        st.sidebar.error("That CSV has no 'item_id' column — it doesn't look like a compliance export.")
+    elif not resume_df.empty:
+        loaded_count, skipped_count = 0, 0
+        for _, row in resume_df.iterrows():
+            item_id = row.get("item_id")
+            if pd.isna(item_id) or not str(item_id).strip():
+                skipped_count += 1
+                continue
+
+            status = _clean_str(row.get("status"), "Not Reviewed")
+            if status not in STATUS_OPTIONS:
+                status = "Not Reviewed"
+
+            st.session_state.responses[str(item_id)] = {
+                "status": status,
+                "notes": _clean_str(row.get("notes")),
+                "reviewer": _clean_str(row.get("reviewer")),
+                "date": _clean_str(row.get("date")),
+                "category": _clean_str(row.get("category")),
+                "control": _clean_str(row.get("control")),
+                "reference": _clean_str(row.get("reference")),
+                "audit_step": _clean_str(row.get("audit_step")),
+            }
+            loaded_count += 1
+
+        if loaded_count:
+            msg = f"Loaded {loaded_count} saved responses."
+            if skipped_count:
+                msg += f" Skipped {skipped_count} row(s) with no item_id."
+            st.sidebar.success(msg)
+        else:
+            st.sidebar.warning("No valid rows found in that CSV (every row was missing an item_id).")
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
@@ -1039,14 +1050,17 @@ st.sidebar.caption(
 # 4. MAIN - Tabs: Checklist / Dashboard
 # ---------------------------------------------------------------------------
 
+_hero_client = html.escape(st.session_state.client_name) if st.session_state.client_name else "—"
+_hero_tech = html.escape(tech)
+_hero_reviewer = html.escape(reviewer) if reviewer else "—"
 st.markdown(f"""
 <div class="hero-banner">
     <p class="hero-title">🛡️ Sentinel GRC</p>
     <p class="hero-sub">Enterprise Security Configuration &amp; Compliance Platform</p>
     <p class="hero-meta">
-        <b>Client:</b> {st.session_state.client_name or '—'} &nbsp;|&nbsp;
-        <b>Technology:</b> {tech} &nbsp;|&nbsp;
-        <b>Reviewer:</b> {reviewer or '—'} &nbsp;|&nbsp;
+        <b>Client:</b> {_hero_client} &nbsp;|&nbsp;
+        <b>Technology:</b> {_hero_tech} &nbsp;|&nbsp;
+        <b>Reviewer:</b> {_hero_reviewer} &nbsp;|&nbsp;
         <b>Library:</b> {len(ALL_CHECKLISTS)} technologies, CIS/vendor-benchmark aligned
     </p>
 </div>
@@ -1091,13 +1105,16 @@ with tab_checklist:
                 col1, col2 = st.columns([3, 1])
                 with col1:
                     pill_class = SEVERITY_PILL_CLASS.get(severity, "sev-low")
-                    fw_line = " · ".join(f"<b>{k}:</b> {v}" for k, v in frameworks.items())
+                    fw_line = " · ".join(
+                        f"<b>{html.escape(str(k))}:</b> {html.escape(str(v))}"
+                        for k, v in frameworks.items()
+                    )
                     st.markdown(f"""
 <div class="control-card">
-    <span class="control-id">{item_id}</span> &nbsp;<span class="status-pill {pill_class}">{severity}</span>
-    <div style="margin-top:6px; color:#e2e8f0; font-size:14.5px;">{control}</div>
-    <div class="control-ref">Reference: {ref}</div>
-    <div class="control-step">🔍 {audit_step}</div>
+    <span class="control-id">{html.escape(item_id)}</span> &nbsp;<span class="status-pill {pill_class}">{html.escape(severity)}</span>
+    <div style="margin-top:6px; color:#e2e8f0; font-size:14.5px;">{html.escape(control)}</div>
+    <div class="control-ref">Reference: {html.escape(ref)}</div>
+    <div class="control-step">🔍 {html.escape(audit_step)}</div>
     <div class="fw-line">{fw_line}</div>
 </div>
 """, unsafe_allow_html=True)
@@ -1169,7 +1186,9 @@ with tab_dashboard:
             "item_id": i,
             "category": recorded[i].get("category", ""),
             "status": recorded[i].get("status", "Not Reviewed"),
-            "severity": recorded[i].get("severity") or classify_control(recorded[i].get("category", ""), "")["severity"],
+            "severity": recorded[i].get("severity") or classify_control(
+                recorded[i].get("category", ""), recorded[i].get("control", "")
+            )["severity"],
         }
         for i in all_ids
     ])
@@ -1311,7 +1330,15 @@ and a one-line recommended next step. Do not invent findings not listed above.""
             )
 
         st.markdown("&nbsp;")
-        nl_question = st.text_input("Ask a question about this assessment", placeholder="e.g. Which encryption-related controls are still open?")
+        if "qa_history" not in st.session_state:
+            # key: technology -> {"question": str, "answer": str, "reviewed": bool}
+            st.session_state.qa_history = {}
+
+        nl_question = st.text_input(
+            "Ask a question about this assessment",
+            placeholder="e.g. Which encryption-related controls are still open?",
+            key="qa_question_input",
+        )
         if st.button("Ask") and nl_question.strip():
             with st.spinner("Thinking..."):
                 context_rows = [
@@ -1328,8 +1355,25 @@ Answer using only the data above. If the data doesn't cover the question, say so
                 answer = ask_ai(qa_prompt, system="You answer strictly from the provided assessment data, citing item IDs where relevant.")
                 if answer.startswith("⚠️"):
                     st.error(answer)
+                    st.session_state.qa_history.pop(tech, None)
                 else:
-                    st.info(answer)
+                    # Persisted (not just shown once) so it survives the next rerun,
+                    # and starts unreviewed — human-in-the-loop confirmation happens below.
+                    st.session_state.qa_history[tech] = {
+                        "question": nl_question, "answer": answer, "reviewed": False,
+                    }
+
+        qa_entry = st.session_state.qa_history.get(tech)
+        if qa_entry:
+            st.info(f"**Q: {qa_entry['question']}**\n\n{qa_entry['answer']}")
+            reviewed = st.checkbox(
+                "✅ Reviewed and confirmed accurate against the underlying evidence",
+                value=qa_entry["reviewed"],
+                key=f"qa_reviewed_{tech}",
+            )
+            st.session_state.qa_history[tech]["reviewed"] = reviewed
+            if not reviewed:
+                st.caption("⚠️ Unreviewed AI output — verify against the actual control evidence before relying on this in a client deliverable.")
 
     st.markdown("---")
     st.markdown("**📄 Export**")
@@ -1351,7 +1395,9 @@ Answer using only the data above. If the data doesn't cover the question, say so
             )
 
     with exp_col2:
-        if st.session_state.responses:
+        if not DOCX_AVAILABLE:
+            st.caption("⚠️ DOCX export unavailable — the `python-docx` package isn't installed. Add `python-docx` to requirements.txt and reboot the app.")
+        elif st.session_state.responses:
             docx_bytes = build_docx_report(
                 client_name=st.session_state.client_name or "Client",
                 technology=tech,
@@ -1364,13 +1410,16 @@ Answer using only the data above. If the data doesn't cover the question, say so
                 exec_summary=st.session_state.exec_summary,
                 all_responses=st.session_state.responses,
             )
-            st.download_button(
-                "⬇️ Download client report (DOCX)",
-                data=docx_bytes,
-                file_name=f"{(st.session_state.client_name or 'client').replace(' ', '_')}_{tech.split(' ')[0]}_report.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True,
-            )
+            if not docx_bytes:
+                st.error("DOCX report could not be generated. Check the server logs for details.")
+            else:
+                st.download_button(
+                    "⬇️ Download client report (DOCX)",
+                    data=docx_bytes,
+                    file_name=f"{(st.session_state.client_name or 'client').replace(' ', '_')}_{tech.split(' ')[0]}_report.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                )
 
 with tab_engagements:
     st.subheader("Engagements")
