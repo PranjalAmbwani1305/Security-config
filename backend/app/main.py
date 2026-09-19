@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from backend.app.api.routes import router
 app = FastAPI(
     title="Sentinel GRC",
     description="Security Configuration & Compliance Platform",
@@ -11,3 +12,4 @@ def health_check():
         "status":"ok",
         "service":"sentinel-grc",
     }
+app.include_router(router)

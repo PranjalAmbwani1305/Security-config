@@ -22,3 +22,18 @@ class Engagement:
     technology: str
     reviewer: str
     results: list[AssessmentResult]
+
+    @dataclass
+    class Risk:
+        risk_id: str
+        engagement_id: str
+        finding_id: str
+        title: str
+        likelihood: int
+        impact: int
+        risk_score: int
+        risk_level:str
+        treatment: str
+        owner: str
+        status: str
+        
