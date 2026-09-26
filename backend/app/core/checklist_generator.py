@@ -3,8 +3,7 @@ import json
 
 from backend.app.core.models import ChecklistItem
 from backend.app.core.checklist_validator import GeneratedChecklistItem
-from backend.app.config import HF_MODEL, HF_TOKEN
-from huggingface_hub import InferenceClient
+
 
 class LLMProvider(ABC):
 
@@ -34,34 +33,8 @@ class MockLLMProvider(LLMProvider):
     }
 ]
 """
-class RealLLMProvider(LLMProvider):
 
-    def __init__(self):
-        if not HF_TOKEN:
-            raise ValueError("HF_TOKEN is not configured")
 
-        if not HF_MODEL:
-            raise ValueError("HF_MODEL is not configured")
-
-        self.client = InferenceClient(
-            api_key=HF_TOKEN
-        )
-
-    def generate(self, prompt: str) -> str:
-
-        response = self.client.chat_completion(
-            model=HF_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-            max_tokens=1000,
-            temperature=0.1,
-        )
-
-        return response.choices[0].message.content
 class ChecklistGenerator:
 
     def __init__(self, provider: LLMProvider):
@@ -95,11 +68,11 @@ Return structured checklist data.
             validated_items = [
                 GeneratedChecklistItem(**item)
                 for item in data
-                ]
+            ]
         except Exception as exc:
             raise ValueError(
                 "LLM provider returned invalid checklist data"
-                ) from exc
+            ) from exc
 
         item_ids = [item.item_id for item in validated_items]
 

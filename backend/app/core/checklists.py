@@ -79,14 +79,55 @@ WINDOWS_CHECKLIST = [
 ]
 
 
-def get_checklist(technology: str) -> list[ChecklistItem]:
+OKF_CHECKLIST = [
+    ChecklistItem(
+        item_id="OKF-001",
+        category="Authentication",
+        control="Privileged access must be restricted",
+        reference="OKF",
+        audit_step="Review privileged account and authentication configuration",
+    ),
+    ChecklistItem(
+        item_id="OKF-002",
+        category="Access Control",
+        control="User access must follow least privilege",
+        reference="OKF",
+        audit_step="Review user roles and access permissions",
+    ),
+    ChecklistItem(
+        item_id="OKF-003",
+        category="Configuration",
+        control="Security configuration must follow the approved baseline",
+        reference="OKF",
+        audit_step="Review system configuration against the approved security baseline",
+    ),
+    ChecklistItem(
+        item_id="OKF-004",
+        category="Logging",
+        control="Security-relevant events must be logged",
+        reference="OKF",
+        audit_step="Verify security logging and monitoring configuration",
+    ),
+    ChecklistItem(
+        item_id="OKF-005",
+        category="Change Management",
+        control="Security configuration changes must be controlled",
+        reference="OKF",
+        audit_step="Review configuration change records and approval process",
+    ),
+]
 
-    technology = technology.lower()
+
+def get_checklist(technology: str) -> list[ChecklistItem]:
+    technology = technology.lower().strip()
 
     if technology == "linux":
         return LINUX_CHECKLIST
 
     if technology == "windows":
         return WINDOWS_CHECKLIST
+
+    if technology == "okf":
+        return OKF_CHECKLIST
 
     return []
