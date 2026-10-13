@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -19,6 +19,7 @@ import {
   WandSparkles,
   X,
   XCircle,
+  UploadCloud,
 } from "lucide-react";
 
 import "./Checklists.css";
@@ -316,6 +317,46 @@ function Checklists() {
     }
   };
 
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [importing, setImporting] = useState(false);
+
+  const importFromFile = async (file: File | undefined) => {
+    if (!file) return;
+    const target = (customTechnology.trim() || checklist?.technology || selectedTechnology).trim();
+    if (!target) {
+      setMessage("Enter a technology name before importing a file.");
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      setMessage("File is larger than 2 MB.");
+      return;
+    }
+    setImporting(true);
+    setMessage("");
+    try {
+      const form = new FormData();
+      form.append("technology", target);
+      form.append("file", file);
+      const response = await apiFetch("/checklist-versions/import", { method: "POST", body: form });
+      if (!response.ok) {
+        setMessage(await errorText(response, "Import failed."));
+        return;
+      }
+      const created = await response.json();
+      applyVersion(created);
+      setSelectedTechnology(target);
+      const warn = created.warnings?.length ? ` Note: ${created.warnings.join("; ")}.` : "";
+      setMessage(
+        `Imported ${created.total_controls} controls from ${file.name} as draft v${created.version_no}. ` +
+          `Review, edit, then submit for approval.${warn}`,
+      );
+      loadTechnologies();
+    } finally {
+      setImporting(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
   const startEditing = (item: ChecklistItem) => {
     setEditingId(item.item_id);
     setEditingControl(item.control);
@@ -591,6 +632,32 @@ function Checklists() {
                 <>
                   <WandSparkles size={16} />
                   Generate with AI
+                </>
+              )}
+            </button>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,.json,.xlsx,.txt,.md"
+              style={{ display: "none" }}
+              onChange={(event) => importFromFile(event.target.files?.[0])}
+            />
+            <button
+              className="generate-button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={importing}
+              title="Upload your own checklist: CSV, JSON, XLSX, TXT or MD (max 2 MB)"
+            >
+              {importing ? (
+                <>
+                  <Loader2 size={16} className="spin" />
+                  Importing...
+                </>
+              ) : (
+                <>
+                  <UploadCloud size={16} />
+                  Import from file
                 </>
               )}
             </button>

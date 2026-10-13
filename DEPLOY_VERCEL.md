@@ -46,12 +46,3 @@ Environment variables (build-time, redeploy after changing):
 - The old Streamlit prototype now lives in `legacy/`
   is not deployed; set the Root Directory as above.
 - Webhooks run inside request time on serverless; long deliveries may hit the 30s limit.
-
-## Verify the deployment
-```bash
-pip install httpx
-API_URL=https://<api>.vercel.app WEB_ORIGIN=https://<web>.vercel.app python backend/scripts/smoke_e2e.py
-```
-It creates two throwaway organizations and checks the full workflow, tenant isolation and
-error codes; every line must say `OK`. A 402 in that output comes from Vercel or your provider
-(billing or plan limit), not from this code.

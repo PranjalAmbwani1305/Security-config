@@ -3,15 +3,17 @@
 draft -> pending_review -> approved | rejected.  Approving a version supersedes the
 previous approved baseline.  Every transition is permission-gated and audited.
 """
+import hashlib
 import uuid
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import AuthContext, request_meta, require_permission
+from app.core.checklist_import import MAX_BYTES, ImportFileError, parse_checklist_file
 from app.core.errors import ApiError
 from app.core.rbac import Permission as P, Role
 from app.db.session import get_db
@@ -120,7 +122,7 @@ def list_technologies(ctx: AuthContext = Depends(require_permission(P.DATA_READ)
 
 
 # ------------------------------------------------------------------ baseline (read, legacy-compatible shape)
-@router.get("/checklists/{technology:path}")
+@router.get("/checklists/{technology}")
 def get_checklist_api(technology: str, ctx: AuthContext = Depends(require_permission(P.DATA_READ)),
                       db: Session = Depends(get_db)):
     b = resolve_baseline(db, ctx.organization_id, technology)
@@ -139,11 +141,10 @@ class CreateVersionRequest(BaseModel):
     notes: str = Field(default="", max_length=5000)
 
 
-@router.post("/checklist-versions", status_code=201)
-def create_version(body: CreateVersionRequest, request: Request,
-                   ctx: AuthContext = Depends(require_permission(P.CHECKLIST_MANAGE)),
-                   db: Session = Depends(get_db)):
-    slug, name, lib_id = checklist_slug(db, body.technology)
+def _create_draft(db, ctx, request, technology: str, source: str, notes: str,
+                  source_rows: list[dict], audit_extra: dict | None = None) -> dict:
+    """Create the next draft version of a technology's checklist from prepared rows."""
+    slug, name, lib_id = checklist_slug(db, technology)
     checklist = db.scalar(select(Checklist).where(
         Checklist.organization_id == ctx.organization_id, Checklist.slug == slug))
     if checklist is None:
@@ -151,26 +152,6 @@ def create_version(body: CreateVersionRequest, request: Request,
                               library_technology_id=lib_id, created_by=ctx.user.id)
         db.add(checklist)
         db.flush()
-
-    source_rows: list[dict] = []
-    if body.source == "library":
-        if lib_id is None:
-            raise ApiError(404, "not_in_library", f"'{body.technology}' is not in the technology library")
-        source_rows = [{"control_id": c.control_id, "category": c.category, "control": c.control,
-                        "audit_step": c.audit_step, "reference": c.reference,
-                        "reference_verified": c.reference_verified, "rationale": ""}
-                       for c in db.scalars(select(LibraryControl).where(
-                           LibraryControl.technology_id == lib_id).order_by(LibraryControl.position))]
-    elif body.source == "baseline":
-        approved = db.scalar(select(ChecklistVersion).where(
-            ChecklistVersion.organization_id == ctx.organization_id,
-            ChecklistVersion.checklist_id == checklist.id, ChecklistVersion.status == "approved"))
-        if approved is None:
-            raise ApiError(404, "no_approved_baseline", "There is no approved baseline to modify")
-        source_rows = [{"control_id": c.control_id, "category": c.category, "control": c.control,
-                        "audit_step": c.audit_step, "reference": c.reference,
-                        "reference_verified": c.reference_verified, "rationale": c.rationale}
-                       for c in _controls(db, ctx, approved.id)]
 
     if db.scalar(select(ChecklistVersion.id).where(
             ChecklistVersion.organization_id == ctx.organization_id,
@@ -183,16 +164,71 @@ def create_version(body: CreateVersionRequest, request: Request,
         ChecklistVersion.organization_id == ctx.organization_id,
         ChecklistVersion.checklist_id == checklist.id)) or 0) + 1
     v = ChecklistVersion(organization_id=ctx.organization_id, checklist_id=checklist.id,
-                         version_no=next_no, status="draft", source=body.source,
-                         notes=body.notes, created_by=ctx.user.id)
+                         version_no=next_no, status="draft", source=source,
+                         notes=notes, created_by=ctx.user.id)
     db.add(v)
     db.flush()
     for pos, r in enumerate(source_rows):
         db.add(ChecklistControl(organization_id=ctx.organization_id, version_id=v.id, position=pos, **r))
     _audit(db, ctx, request, "checklist.created", v.id,
-           {"technology": name, "version_no": next_no, "source": body.source, "controls": len(source_rows)})
+           {"technology": name, "version_no": next_no, "source": source,
+            "controls": len(source_rows), **(audit_extra or {})})
     _commit(db)
     return _version_out(v, checklist, _controls(db, ctx, v.id))
+
+
+@router.post("/checklist-versions", status_code=201)
+def create_version(body: CreateVersionRequest, request: Request,
+                   ctx: AuthContext = Depends(require_permission(P.CHECKLIST_MANAGE)),
+                   db: Session = Depends(get_db)):
+    slug, name, lib_id = checklist_slug(db, body.technology)
+    source_rows: list[dict] = []
+    if body.source == "library":
+        if lib_id is None:
+            raise ApiError(404, "not_in_library", f"'{body.technology}' is not in the technology library")
+        source_rows = [{"control_id": c.control_id, "category": c.category, "control": c.control,
+                        "audit_step": c.audit_step, "reference": c.reference,
+                        "reference_verified": c.reference_verified, "rationale": ""}
+                       for c in db.scalars(select(LibraryControl).where(
+                           LibraryControl.technology_id == lib_id).order_by(LibraryControl.position))]
+    elif body.source == "baseline":
+        checklist = db.scalar(select(Checklist).where(
+            Checklist.organization_id == ctx.organization_id, Checklist.slug == slug))
+        approved = checklist and db.scalar(select(ChecklistVersion).where(
+            ChecklistVersion.organization_id == ctx.organization_id,
+            ChecklistVersion.checklist_id == checklist.id, ChecklistVersion.status == "approved"))
+        if not approved:
+            raise ApiError(404, "no_approved_baseline", "There is no approved baseline to modify")
+        source_rows = [{"control_id": c.control_id, "category": c.category, "control": c.control,
+                        "audit_step": c.audit_step, "reference": c.reference,
+                        "reference_verified": c.reference_verified, "rationale": c.rationale}
+                       for c in _controls(db, ctx, approved.id)]
+    return _create_draft(db, ctx, request, body.technology, body.source, body.notes, source_rows)
+
+
+@router.post("/checklist-versions/import", status_code=201)
+def import_version(request: Request,
+                   technology: str = Form(min_length=1, max_length=200),
+                   notes: str = Form(default="", max_length=5000),
+                   file: UploadFile = File(...),
+                   ctx: AuthContext = Depends(require_permission(P.CHECKLIST_MANAGE)),
+                   db: Session = Depends(get_db)):
+    """Create a DRAFT checklist from a client-supplied file (.csv .json .xlsx .txt .md).
+
+    The file is untrusted: it is size/row/length limited, parsed (never executed), its
+    controls are marked unverified, and the draft still goes through submit -> approve."""
+    data = file.file.read(MAX_BYTES + 1)
+    try:
+        controls, warnings = parse_checklist_file(file.filename or "", data)
+    except ImportFileError as exc:
+        raise ApiError(422, "invalid_import_file", str(exc)) from None
+    safe_name = "".join(ch for ch in (file.filename or "upload") if ch.isprintable())[:120]
+    digest = hashlib.sha256(data).hexdigest()
+    out = _create_draft(db, ctx, request, technology, "import",
+                        (notes.strip() + f"\nImported from file: {safe_name}").strip(), controls,
+                        {"file": safe_name, "sha256": digest})
+    out["warnings"] = warnings
+    return out
 
 
 @router.get("/checklist-versions")

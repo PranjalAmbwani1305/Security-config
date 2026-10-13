@@ -15,7 +15,7 @@ router = APIRouter(tags=["library"])
 checklist_generator_service = get_checklist_generator()
 
 
-@router.get("/checklists/{technology:path}/generate")
+@router.get("/checklists/{technology}/generate")
 def generate_checklist_api(technology: str, _: AuthContext = Depends(require_permission(P.AI_GENERATE))):
     checklist = checklist_generator_service.generate(technology)
     return {"technology": technology, "source": "AI-Generated",

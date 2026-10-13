@@ -1,0 +1,5 @@
+# Network
+- Telnet must be disabled on all devices
+- Management interfaces must not be exposed to the internet
+# Backup
+1. Backups must be tested by restore every quarter

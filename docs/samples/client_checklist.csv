@@ -1,0 +1,6 @@
+control_id,category,control,audit_step,reference
+ACME-001,Authentication,MFA must be enforced for all admin logins,Review IdP policy for admin groups,ISO 27001 A.8.5
+ACME-002,Access Control,Quarterly access review must be performed,Obtain last two access review sign-offs,ISO 27001 A.5.18
+ACME-003,Logging,Audit logs must be retained for 12 months,Check retention setting and sample old logs,ISO 27001 A.8.15
+ACME-004,Encryption,Customer data must be encrypted at rest,Verify storage encryption configuration,ISO 27001 A.8.24
+ACME-005,Patch Management,Critical patches must be applied within 14 days,Compare patch report with SLA,ISO 27001 A.8.8

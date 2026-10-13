@@ -97,7 +97,9 @@ export async function refreshSession(): Promise<boolean> {
 
 export async function apiFetch(path: string, init: RequestInit = {}, retry = true): Promise<Response> {
   const headers = new Headers(init.headers);
-  if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  // FormData must keep the browser-generated multipart boundary, so no JSON header for it.
+  if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type"))
+    headers.set("Content-Type", "application/json");
   if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
 
   const res = await fetch(`${API_URL}${path}`, { ...init, headers });
@@ -116,18 +118,4 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (!res.ok) throw await parseError(res);
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
-}
-
-/** Best human-readable message from a failed response (backend `error.message`, `detail`, or fallback). */
-export async function readError(res: Response, fallback: string): Promise<string> {
-  try {
-    const body = await res.clone().json();
-    if (body?.error?.message) return body.error.message;
-    if (typeof body?.detail === "string") return body.detail;
-    if (Array.isArray(body?.detail) && body.detail[0]?.msg) return body.detail[0].msg;
-  } catch {
-    /* not JSON */
-  }
-  if (res.status === 403) return "You don't have permission to do that.";
-  return `${fallback} (${res.status})`;
 }
