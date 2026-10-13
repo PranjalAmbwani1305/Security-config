@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import "./Engagements.css";
 import { apiFetch } from "../lib/api";
+import { useAuth } from "../auth/AuthContext";
 
 
 
@@ -32,6 +33,8 @@ type Engagement = {
 };
 
 function Engagements() {
+  const { can } = useAuth();
+  const canCreate = can("engagement.create");
   const [engagements, setEngagements] = useState<Engagement[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [clientName, setClientName] = useState("");
@@ -240,6 +243,8 @@ function Engagements() {
 
             <button
               className="primary-button"
+              disabled={!canCreate}
+              title={canCreate ? undefined : "You don't have permission to create engagements"}
               onClick={() => {
                 setMessage("");
                 setShowForm(true);

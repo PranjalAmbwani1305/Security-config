@@ -117,3 +117,17 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
+
+/** Best human-readable message from a failed response (backend `error.message`, `detail`, or fallback). */
+export async function readError(res: Response, fallback: string): Promise<string> {
+  try {
+    const body = await res.clone().json();
+    if (body?.error?.message) return body.error.message;
+    if (typeof body?.detail === "string") return body.detail;
+    if (Array.isArray(body?.detail) && body.detail[0]?.msg) return body.detail[0].msg;
+  } catch {
+    /* not JSON */
+  }
+  if (res.status === 403) return "You don't have permission to do that.";
+  return `${fallback} (${res.status})`;
+}

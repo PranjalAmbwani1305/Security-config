@@ -73,8 +73,8 @@ def create_app() -> FastAPI:
     app.include_router(organizations.router)
     app.include_router(platform.router)
     app.include_router(grc.router)
+    app.include_router(library.router)  # before checklists: its /checklists/{tech:path}/generate must win
     app.include_router(checklists.router)
-    app.include_router(library.router)
     return app
 
 

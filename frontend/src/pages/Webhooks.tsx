@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import "./Webhooks.css";
 import { apiFetch } from "../lib/api";
+import { useAuth } from "../auth/AuthContext";
 
 
 
@@ -26,7 +27,7 @@ type Webhook = {
   last_status?: string | null;
 };
 
-export default function Webhooks() {
+function WebhooksInner() {
   const [webhooks, setWebhooks] = useState<Webhook[]>([]);
   const [loading, setLoading] = useState(true);
   const [showModal, setShowModal] = useState(false);
@@ -497,4 +498,17 @@ export default function Webhooks() {
       )}
     </div>
   );
+}
+/** The backend only allows webhook management for admins and GRC managers; don't fire requests that 403. */
+export default function Webhooks() {
+  const { can } = useAuth();
+  if (!can("webhook.manage")) {
+    return (
+      <div style={{ padding: 32, color: "#8aa0bd" }}>
+        <h2 style={{ color: "#e5e7eb", marginBottom: 8 }}>Webhooks</h2>
+        <p>You don&apos;t have permission to manage webhooks. Ask an organization admin or GRC manager.</p>
+      </div>
+    );
+  }
+  return <WebhooksInner />;
 }

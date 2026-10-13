@@ -19,7 +19,8 @@ import {
 } from "lucide-react";
 
 import "./Assessments.css";
-import { apiFetch } from "../lib/api";
+import { apiFetch, readError } from "../lib/api";
+import { useAuth } from "../auth/AuthContext";
 
 type Engagement = {
   engagement_id: string;
@@ -80,6 +81,8 @@ const STATUS_OPTIONS: ControlStatus[] = [
 ];
 
 function Assessments() {
+  const { can } = useAuth();
+  const canPerform = can("assessment.perform");
   const [engagements, setEngagements] = useState<Engagement[]>([]);
 
   const [selectedEngagement, setSelectedEngagement] =
@@ -233,6 +236,28 @@ function Assessments() {
           notes: "",
         };
       });
+
+      // Restore anything already saved for this engagement.
+      if (selectedEngagement) {
+        const saved = await apiFetch(
+          `/assessments/${encodeURIComponent(selectedEngagement)}`,
+        );
+        if (saved.ok) {
+          const payload = await saved.json();
+          // API shape: { engagement_id, assessments: [{ results: [...] }] }
+          const rows: AssessmentResult[] =
+            payload.assessments?.[0]?.results || payload.results || [];
+          rows.forEach((row) => {
+            if (initialResults[row.item_id]) {
+              initialResults[row.item_id] = {
+                item_id: row.item_id,
+                status: row.status,
+                notes: row.notes || "",
+              };
+            }
+          });
+        }
+      }
 
       setResults(initialResults);
     } catch (error) {
@@ -402,7 +427,7 @@ function Assessments() {
      SUBMIT ASSESSMENT
   ========================================================== */
 
-  const submitAssessment = async () => {
+  const submitAssessment = async (saveOnly = false) => {
     if (!selectedEngagement) {
       setMessageType("error");
       setMessage(
@@ -419,7 +444,7 @@ function Assessments() {
       return;
     }
 
-    if (summary.reviewed === 0) {
+    if (!saveOnly && summary.reviewed === 0) {
       setMessageType("error");
       setMessage(
         "Review at least one control before submitting.",
@@ -461,8 +486,14 @@ function Assessments() {
 
       if (!response.ok) {
         throw new Error(
-          "Assessment submission failed.",
+          await readError(response, "Assessment submission failed"),
         );
+      }
+
+      if (saveOnly) {
+        setMessageType("success");
+        setMessage("Progress saved.");
+        return;
       }
 
       const data: AssessmentResponse =
@@ -561,7 +592,9 @@ function Assessments() {
 
             <button
               className="refresh-button"
-              onClick={loadEngagements}
+              onClick={() => submitAssessment(true)}
+              disabled={submitting || !checklist || !canPerform}
+              title={canPerform ? undefined : "You don't have permission to save assessments"}
             >
               <Save size={15} />
               Save Progress
@@ -569,11 +602,13 @@ function Assessments() {
 
             <button
               className="submit-button"
-              onClick={submitAssessment}
+              onClick={() => submitAssessment(false)}
               disabled={
                 submitting ||
-                !checklist
+                !checklist ||
+                !canPerform
               }
+              title={canPerform ? undefined : "You don't have permission to submit assessments"}
             >
               {submitting ? (
                 <Loader2

@@ -120,7 +120,7 @@ def list_technologies(ctx: AuthContext = Depends(require_permission(P.DATA_READ)
 
 
 # ------------------------------------------------------------------ baseline (read, legacy-compatible shape)
-@router.get("/checklists/{technology}")
+@router.get("/checklists/{technology:path}")
 def get_checklist_api(technology: str, ctx: AuthContext = Depends(require_permission(P.DATA_READ)),
                       db: Session = Depends(get_db)):
     b = resolve_baseline(db, ctx.organization_id, technology)

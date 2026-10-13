@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import "./Risks.css";
 import { apiFetch } from "../lib/api";
+import { useAuth } from "../auth/AuthContext";
 
 
 
@@ -49,6 +50,8 @@ const treatmentOptions = ["Mitigate", "Accept", "Transfer", "Avoid"];
 const statusOptions = ["Open", "Monitoring", "Closed"];
 
 function Risks() {
+  const { can } = useAuth();
+  const canManage = can("risk.manage");
   const [engagements, setEngagements] = useState<Engagement[]>([]);
   const [selectedEngagement, setSelectedEngagement] = useState("");
   const [findings, setFindings] = useState<Finding[]>([]);
@@ -376,7 +379,8 @@ function Risks() {
           <button
             className="primary-button"
             onClick={openCreateModal}
-            disabled={findings.length === 0}
+            disabled={findings.length === 0 || !canManage}
+            title={canManage ? undefined : "You don't have permission to create risks"}
           >
             <Plus size={17} />
             Create Risk

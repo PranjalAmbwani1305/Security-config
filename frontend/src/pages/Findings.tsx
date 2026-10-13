@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import "./Findings.css";
 import { apiFetch } from "../lib/api";
+import { useAuth } from "../auth/AuthContext";
 
 
 
@@ -58,6 +59,8 @@ const severityOptions = ["Critical", "High", "Medium", "Low"];
 const statusOptions = ["Open", "In Progress", "Resolved", "Accepted"];
 
 function Findings() {
+  const { can } = useAuth();
+  const canCreate = can("finding.create");
   const [engagements, setEngagements] = useState<Engagement[]>([]);
   const [selectedEngagement, setSelectedEngagement] = useState("");
 
@@ -141,7 +144,7 @@ function Findings() {
 
       const [checklistResponse, assessmentResponse, findingsResponse] =
         await Promise.all([
-          apiFetch(`/checklists/${engagement.technology}`),
+          apiFetch(`/checklists/${encodeURIComponent(engagement.technology)}`),
           apiFetch(`/assessments/${engagementId}`),
           apiFetch(`/findings/${engagementId}`),
         ]);
@@ -395,12 +398,13 @@ function Findings() {
 
             <button
               className="findings-primary-button"
+              title={canCreate ? undefined : "You don't have permission to create findings"}
               onClick={() => {
                 setError("");
                 setSuccessMessage("");
                 setShowCreate(true);
               }}
-              disabled={!selectedEngagement}
+              disabled={!selectedEngagement || !canCreate}
             >
               <Plus size={17} />
               New Finding
